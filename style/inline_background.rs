@@ -38,6 +38,8 @@ pub(crate) struct InlineBackgroundBaseline {
     declarations: Arc<Locked<PropertyDeclarationBlock>>,
     revision: u64,
     epoch: u64,
+    // Optional authority used only by the complete retained batch path.
+    viewport: Option<BackgroundViewportStamp>,
     // Cleared by the consumer or the next restyle. No old-style history chain.
     previous: Option<Arc<ComputedValues>>,
     // A final, bounded UA-only Selection proof. No ComputedValues history chain.
@@ -49,6 +51,52 @@ impl InlineBackgroundBaseline {
         Some(crate::data::BackgroundColorChangeWitness {
             old: self.previous.take()?,
             new: self.style.clone(),
+        })
+    }
+}
+
+// Servo resolves every ViewportVariant from this one CSS viewport; screen size
+// and DPR also participate in media features. Keep their exact positive finite
+// bit patterns plus the independently invalidated Layout epoch, not a hash.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BackgroundViewportStamp {
+    epoch: u64,
+    values: [u32; 5],
+}
+
+impl BackgroundViewportStamp {
+    fn capture<E: TElement>(context: &StyleContext<E>) -> Option<Self> {
+        Self::for_device(
+            context.shared.inline_background_epoch?,
+            context.shared.stylist.device(),
+        )
+    }
+
+    fn for_device(epoch: u64, device: &crate::device::Device) -> Option<Self> {
+        let css = device.viewport_size();
+        let physical = device.device_size();
+        Self::from_values(
+            epoch,
+            [
+                css.width,
+                css.height,
+                physical.width,
+                physical.height,
+                device.device_pixel_ratio().get(),
+            ],
+        )
+    }
+
+    fn from_values(epoch: u64, values: [f32; 5]) -> Option<Self> {
+        if values
+            .iter()
+            .any(|value| !value.is_finite() || *value <= 0.0)
+        {
+            return None;
+        }
+        Some(Self {
+            epoch,
+            values: values.map(f32::to_bits),
         })
     }
 }
@@ -66,6 +114,43 @@ fn supported_independent_inputs(style: &ComputedValues) -> bool {
         | Flags::DEPENDS_ON_INHERITED_FONT_METRICS
         | Flags::IS_ROOT_ELEMENT_STYLE
         | Flags::USES_VIEWPORT_UNITS
+        | Flags::USES_VIEWPORT_UNITS_ON_CONTAINER_QUERIES
+        | Flags::SELF_OR_ANCESTOR_HAS_SIZE_CONTAINER_TYPE
+        | Flags::USES_CONTAINER_UNITS
+        | Flags::CONSIDERED_NONTRIVIAL_SCOPED_STYLE
+        | Flags::DISPLAY_CONTENTS_IN_ITEM_CONTAINER
+        | Flags::DEPENDS_ON_CONTAINER_STYLE_QUERY
+        | Flags::USES_FONT_OR_WM_RELATIVE_UNITS
+        | Flags::USES_FONT_OR_WM_RELATIVE_UNITS_ON_CONTAINER_QUERIES
+        | Flags::tree_counting_function_flags();
+    style.visited_style().is_none()
+        && style.attribute_references.is_none()
+        && !style.flags.intersects(dependencies)
+        && !style.get_ui().specifies_animations()
+        && !style.get_ui().specifies_transitions()
+        && style
+            .rules
+            .as_ref()
+            .is_some_and(|r| !r.has_animation_or_transition_rules())
+        && !style
+            .get_background()
+            .background_image
+            .0
+            .iter()
+            .any(|image| matches!(image, Image::PaintWorklet(_)))
+}
+
+// Only baseline recording and the separately stamped complete batch may use
+// this alternative. The ordinary recascade and Selection guard above stay
+// byte-for-byte unchanged. No container-query viewport flag is admitted.
+fn supported_viewport_batch_inputs(style: &ComputedValues) -> bool {
+    let dependencies = Flags::IS_RELEVANT_LINK_VISITED
+        | Flags::IS_IN_FIRST_LINE_SUBTREE
+        | Flags::DISPLAY_OR_CONTENT_DEPEND_ON_INHERITED_STYLE
+        | Flags::INHERITS_RESET_STYLE
+        | Flags::DEPENDS_ON_SELF_FONT_METRICS
+        | Flags::DEPENDS_ON_INHERITED_FONT_METRICS
+        | Flags::IS_ROOT_ELEMENT_STYLE
         | Flags::USES_VIEWPORT_UNITS_ON_CONTAINER_QUERIES
         | Flags::SELF_OR_ANCESTOR_HAS_SIZE_CONTAINER_TYPE
         | Flags::USES_CONTAINER_UNITS
@@ -211,8 +296,19 @@ pub(crate) fn record_final<E: TElement>(
     let create = || -> Option<InlineBackgroundBaseline> {
         let epoch = context.shared.inline_background_epoch?;
         let style = data.styles.primary.as_ref()?;
+        let viewport = if style.flags.contains(Flags::USES_VIEWPORT_UNITS) {
+            Some(BackgroundViewportStamp::capture(context)?)
+        } else {
+            None
+        };
+        // Recording is not admission: ordinary try_recascade still applies its
+        // original strict guard. Only a later complete batch can match this stamp.
+        let supported = supported_style(style)
+            || (viewport.is_some()
+                && !style.is_pseudo_style()
+                && supported_viewport_batch_inputs(style));
         if !supported_pseudos(&data.styles.pseudos)
-            || !supported_style(style)
+            || !supported
             || context.shared.traversal_flags.for_animation_only()
             || context.shared.stylist.device().forced_colors().is_active()
         {
@@ -245,6 +341,7 @@ pub(crate) fn record_final<E: TElement>(
             declarations: declarations.clone(),
             revision,
             epoch,
+            viewport,
             previous: None,
             selection: batch::selection_baseline(context, &data.styles.pseudos),
         })

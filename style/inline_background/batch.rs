@@ -48,6 +48,7 @@ struct BackgroundStyleFamily {
     parent_style: Arc<ComputedValues>,
     declarations: Arc<Locked<PropertyDeclarationBlock>>,
     epoch: u64,
+    viewport: Option<BackgroundViewportStamp>,
     selection: SelectionBaseline,
 }
 
@@ -58,6 +59,7 @@ impl BackgroundStyleFamily {
             parent_style: baseline.parent_style.clone(),
             declarations: baseline.declarations.clone(),
             epoch: baseline.epoch,
+            viewport: baseline.viewport,
             selection: SelectionBaseline {
                 style: baseline.selection.as_ref().unwrap().style.clone(),
             },
@@ -72,6 +74,7 @@ impl BackgroundStyleFamily {
             && Arc::ptr_eq(&self.parent_style, &baseline.parent_style)
             && Arc::ptr_eq(&self.declarations, &baseline.declarations)
             && self.epoch == baseline.epoch
+            && self.viewport == baseline.viewport
             && match (&self.selection.style, &selection.style) {
                 (None, None) => true,
                 (Some(a), Some(b)) => Arc::ptr_eq(a, b),
@@ -85,6 +88,8 @@ impl BackgroundStyleFamily {
 pub struct BackgroundBatchProof {
     epoch: u64,
     stylist: usize,
+    // Captured once under the exclusive Layout/environment preparation guard.
+    viewport: Option<BackgroundViewportStamp>,
 }
 
 impl BackgroundBatchProof {
@@ -103,6 +108,7 @@ impl BackgroundBatchProof {
         Some(Self {
             epoch: context.shared.inline_background_epoch?,
             stylist: context.shared.stylist as *const _ as usize,
+            viewport: BackgroundViewportStamp::capture(context),
         })
     }
 
@@ -340,6 +346,26 @@ pub fn prepare_background_style_in_batch<E: TElement>(
     )
 }
 
+fn viewport_matches_batch(
+    expected: Option<BackgroundViewportStamp>,
+    current: Option<BackgroundViewportStamp>,
+) -> bool {
+    expected.is_none() || expected == current
+}
+
+fn supported_style_for_batch(
+    style: &ComputedValues,
+    expected: Option<BackgroundViewportStamp>,
+    current: Option<BackgroundViewportStamp>,
+) -> bool {
+    supported_style(style)
+        || (expected.is_some()
+            && expected == current
+            && style.flags.contains(Flags::USES_VIEWPORT_UNITS)
+            && !style.is_pseudo_style()
+            && supported_viewport_batch_inputs(style))
+}
+
 fn prepare_background_style_inner<E: TElement>(
     context: &StyleContext<E>,
     element: E,
@@ -367,12 +393,18 @@ fn prepare_background_style_inner<E: TElement>(
     }
     let old = data.styles.primary.as_ref()?;
     let baseline = data.inline_background.as_ref()?;
+    let viewport = batch.and_then(|(proof, _)| proof.viewport);
+    // Always revalidate the stamp, including a cached-family hit. A query or
+    // non-batch caller never receives viewport-dependent admission.
+    if !viewport_matches_batch(baseline.viewport, viewport) {
+        return None;
+    }
     let same_family = reuse
         .as_ref()
         .is_some_and(|reuse| reuse.matches(old, baseline));
     if baseline.epoch != epoch
         || !Arc::ptr_eq(old, &baseline.style)
-        || (!same_family && !supported_style(old))
+        || (!same_family && !supported_style_for_batch(old, baseline.viewport, viewport))
     {
         return None;
     }
@@ -536,6 +568,190 @@ mod tests {
         Arc::new(values)
     }
 
+    fn viewport_test_style(extra: Flags) -> Arc<ComputedValues> {
+        let lock = SharedRwLock::new();
+        let tree = RuleTree::new();
+        let rules = tree.insert_ordered_rules(
+            [(
+                source(&lock, "background-color:black"),
+                priority(CascadeOrigin::UA),
+            )]
+            .into_iter(),
+        );
+        let mut style = (*values(AbsoluteColor::BLACK, Some(rules), false)).clone();
+        style.flags.insert(Flags::USES_VIEWPORT_UNITS | extra);
+        Arc::new(style)
+    }
+
+    #[test]
+    fn stable_viewport_batch_exact_stamp_admits_without_relaxing_ordinary_guard() {
+        let style = viewport_test_style(Flags::empty());
+        let stamp = BackgroundViewportStamp::from_values(7, [1280., 720., 1920., 1080., 1.5]);
+        assert!(stamp.is_some());
+        assert!(!supported_style(&style));
+        assert!(supported_style_for_batch(&style, stamp, stamp));
+        assert!(!supported_style_for_batch(&style, stamp, None));
+        assert!(!supported_style_for_batch(&style, None, stamp));
+    }
+
+    #[test]
+    fn stable_viewport_batch_resize_dpr_screen_and_epoch_changes_reject_until_fresh_baseline() {
+        let style = viewport_test_style(Flags::empty());
+        let values = [1280., 720., 1920., 1080., 1.5];
+        let old = BackgroundViewportStamp::from_values(7, values);
+        for index in 0..5 {
+            let mut changed = values;
+            changed[index] += 1.;
+            let current = BackgroundViewportStamp::from_values(8, changed);
+            assert!(!viewport_matches_batch(old, current));
+            assert!(!supported_style_for_batch(&style, old, current));
+            assert!(supported_style_for_batch(&style, current, current));
+        }
+        let media_epoch = BackgroundViewportStamp::from_values(8, values);
+        assert!(!supported_style_for_batch(&style, old, media_epoch));
+    }
+
+    #[test]
+    fn stable_viewport_batch_unknown_nonfinite_and_other_dependencies_stay_rejected() {
+        for value in [0., -1., f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for index in 0..5 {
+                let mut values = [1280., 720., 1920., 1080., 1.5];
+                values[index] = value;
+                assert!(BackgroundViewportStamp::from_values(7, values).is_none());
+            }
+        }
+        let stamp = BackgroundViewportStamp::from_values(7, [1280., 720., 1920., 1080., 1.5]);
+        for flags in [
+            Flags::USES_VIEWPORT_UNITS_ON_CONTAINER_QUERIES,
+            Flags::USES_CONTAINER_UNITS,
+            Flags::DEPENDS_ON_SELF_FONT_METRICS,
+            Flags::INHERITS_RESET_STYLE,
+        ] {
+            assert!(!supported_style_for_batch(
+                &viewport_test_style(flags),
+                stamp,
+                stamp
+            ));
+        }
+    }
+
+    #[test]
+    fn stable_viewport_batch_family_seal_survives_commit_but_not_resize_or_abandoned_prepare() {
+        let mut data = reuse_fixture();
+        let epoch = data.inline_background.as_ref().unwrap().epoch;
+        let stamp = BackgroundViewportStamp::from_values(epoch, [1280., 720., 1920., 1080., 1.5]);
+        data.inline_background.as_mut().unwrap().viewport = stamp;
+        let first = stage_reuse(&data, AbsoluteColor::WHITE, None);
+        let reuse = commit_background_style(&mut data, first);
+        assert_eq!(reuse.family.viewport, stamp);
+        assert!(reuse.matches(
+            data.styles.primary.as_ref().unwrap(),
+            data.inline_background.as_ref().unwrap()
+        ));
+        let old = data.styles.primary.as_ref().unwrap().clone();
+        drop(stage_reuse(&data, AbsoluteColor::BLACK, Some(reuse)));
+        assert!(Arc::ptr_eq(data.styles.primary.as_ref().unwrap(), &old));
+        assert_eq!(data.inline_background.as_ref().unwrap().viewport, stamp);
+        let resized =
+            BackgroundViewportStamp::from_values(epoch + 1, [1440., 900., 1920., 1080., 1.5]);
+        assert!(!viewport_matches_batch(stamp, resized));
+        assert!(!viewport_matches_batch(stamp, None));
+        let fresh = stage_reuse(&data, AbsoluteColor::BLACK, None);
+        let reuse = commit_background_style(&mut data, fresh);
+        data.inline_background.as_mut().unwrap().viewport = resized;
+        assert!(!reuse.matches(
+            data.styles.primary.as_ref().unwrap(),
+            data.inline_background.as_ref().unwrap()
+        ));
+    }
+
+    #[test]
+    fn stable_viewport_batch_actual_device_setters_and_commit_preserve_viewport_flags() {
+        #[derive(Debug)]
+        struct NoFontQueries;
+        impl crate::device::servo::FontMetricsProvider for NoFontQueries {
+            fn query_font_metrics(
+                &self,
+                _: bool,
+                _: &Font,
+                _: crate::values::computed::CSSPixelLength,
+                _: crate::values::specified::font::QueryFontMetricsFlags,
+            ) -> crate::font_metrics::FontMetrics {
+                panic!("viewport capture must not query font metrics")
+            }
+            fn base_size_for_generic(
+                &self,
+                _: crate::values::computed::font::GenericFontFamily,
+            ) -> crate::values::computed::Length {
+                panic!("viewport capture must not query font size")
+            }
+        }
+        let mut device = crate::device::Device::new(
+            crate::media_queries::MediaType::screen(),
+            QuirksMode::NoQuirks,
+            euclid::Size2D::new(400., 240.),
+            euclid::Size2D::new(800., 480.),
+            euclid::Scale::new(2.),
+            Box::new(NoFontQueries),
+            ComputedValues::initial_values_with_font_override(Font::initial_values()),
+            crate::queries::values::PrefersColorScheme::Light,
+            crate::servo::media_features::PointerCapabilities::default(),
+            crate::servo::media_features::PointerCapabilities::default(),
+        );
+        let old = BackgroundViewportStamp::for_device(7, &device).unwrap();
+        device.set_viewport_size(euclid::Size2D::new(600., 320.));
+        let resized = BackgroundViewportStamp::for_device(7, &device).unwrap();
+        assert!(!viewport_matches_batch(Some(old), Some(resized)));
+        device.set_device_pixel_ratio(euclid::Scale::new(1.5));
+        let dpr = BackgroundViewportStamp::for_device(7, &device).unwrap();
+        assert!(!viewport_matches_batch(Some(resized), Some(dpr)));
+        device.set_device_size(euclid::Size2D::new(1200., 640.));
+        let screen = BackgroundViewportStamp::for_device(7, &device).unwrap();
+        assert!(!viewport_matches_batch(Some(dpr), Some(screen)));
+        let renewed = BackgroundViewportStamp::for_device(8, &device).unwrap();
+        assert!(!viewport_matches_batch(Some(screen), Some(renewed)));
+        let viewport_style = viewport_test_style(Flags::empty());
+        assert!(!supported_style_for_batch(
+            &viewport_style,
+            Some(old),
+            Some(renewed)
+        ));
+        assert!(supported_style_for_batch(
+            &viewport_style,
+            Some(renewed),
+            Some(renewed)
+        ));
+        // Exercise the actual complete-style constructor and positive commit,
+        // not a synthetic counter. Viewport geometry flags must survive both.
+        let mut data = reuse_fixture();
+        let mut primary = (**data.styles.primary.as_ref().unwrap()).clone();
+        primary.flags.insert(Flags::USES_VIEWPORT_UNITS);
+        let primary = Arc::new(primary);
+        data.styles.primary = Some(primary.clone());
+        let baseline = data.inline_background.as_mut().unwrap();
+        baseline.style = primary;
+        baseline.epoch = 8;
+        baseline.viewport = Some(renewed);
+        let prepared = stage_reuse(&data, AbsoluteColor::WHITE, None);
+        assert!(prepared
+            .new_primary()
+            .flags
+            .contains(Flags::USES_VIEWPORT_UNITS));
+        let reuse = commit_background_style(&mut data, prepared);
+        assert!(data
+            .styles
+            .primary
+            .as_ref()
+            .unwrap()
+            .flags
+            .contains(Flags::USES_VIEWPORT_UNITS));
+        assert_eq!(reuse.family.viewport, Some(renewed));
+        assert_eq!(
+            data.inline_background.as_ref().unwrap().viewport,
+            Some(renewed)
+        );
+    }
+
     fn source(lock: &SharedRwLock, css: &str) -> StyleSource {
         let url = UrlExtraData(Arc::new(url::Url::parse("about:blank").unwrap()));
         let block =
@@ -680,6 +896,7 @@ mod tests {
                 declarations: declarations.clone(),
                 revision,
                 epoch: 4,
+                viewport: None,
                 previous: None,
                 selection: Some(SelectionBaseline {
                     style: Some(selected.clone()),
@@ -744,6 +961,7 @@ mod tests {
             declarations,
             revision: 1,
             epoch: 4,
+            viewport: None,
             previous: None,
             selection: Some(SelectionBaseline {
                 style: Some(selected),
