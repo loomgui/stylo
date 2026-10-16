@@ -6,7 +6,7 @@
 
 use crate::applicable_declarations::ApplicableDeclarationList;
 use crate::computed_value_flags::ComputedValueFlags;
-use crate::context::{CascadeInputs, ElementCascadeInputs, StyleContext};
+use crate::context::{CascadeInputs, EagerPseudoCascadeInputs, ElementCascadeInputs, StyleContext};
 use crate::data::{EagerPseudoStyles, ElementStyles};
 use crate::dom::{TElement, TNode};
 use crate::matching::MatchMethods;
@@ -417,42 +417,64 @@ where
             let primary_style =
                 self.cascade_primary_style(inputs.primary, parent_style, layout_parent_style);
 
-            let mut pseudo_styles = EagerPseudoStyles::default();
-            if let Some(mut pseudo_array) = inputs.pseudos.into_array() {
-                let layout_parent_style_for_pseudo = if primary_style.style().is_display_contents()
-                {
-                    layout_parent_style
-                } else {
-                    Some(primary_style.style())
-                };
+            self.cascade_pseudos(primary_style, inputs.pseudos, layout_parent_style)
+        })
+    }
 
-                for (i, inputs) in pseudo_array.iter_mut().enumerate() {
-                    if let Some(inputs) = inputs.take() {
-                        let pseudo = PseudoElement::from_eager_index(i);
+    /// Cascade the existing eager-pseudo inputs under a proven primary style.
+    /// All pseudo cascade, visited, and generation rules remain shared with the
+    /// ordinary primary cascade above.
+    #[cfg(feature = "servo")]
+    pub(crate) fn cascade_pseudos_with_default_parents(
+        &mut self,
+        primary_style: PrimaryStyle,
+        pseudo_inputs: EagerPseudoCascadeInputs,
+    ) -> ResolvedElementStyles {
+        with_default_parent_styles(self.element, move |_, layout_parent_style| {
+            self.cascade_pseudos(primary_style, pseudo_inputs, layout_parent_style)
+        })
+    }
 
-                        let style = self.cascade_style_and_visited(
-                            inputs,
-                            Some(primary_style.style()),
-                            layout_parent_style_for_pseudo,
-                            Some(&pseudo),
-                        );
+    fn cascade_pseudos(
+        &mut self,
+        primary_style: PrimaryStyle,
+        pseudo_inputs: EagerPseudoCascadeInputs,
+        layout_parent_style: Option<&ComputedValues>,
+    ) -> ResolvedElementStyles {
+        let mut pseudo_styles = EagerPseudoStyles::default();
+        if let Some(mut pseudo_array) = pseudo_inputs.into_array() {
+            let layout_parent_style_for_pseudo = if primary_style.style().is_display_contents() {
+                layout_parent_style
+            } else {
+                Some(primary_style.style())
+            };
 
-                        if !matches!(self.pseudo_resolution, PseudoElementResolution::Force)
-                            && eager_pseudo_is_definitely_not_generated(&pseudo, &style.0)
-                        {
-                            continue;
-                        }
+            for (i, inputs) in pseudo_array.iter_mut().enumerate() {
+                if let Some(inputs) = inputs.take() {
+                    let pseudo = PseudoElement::from_eager_index(i);
 
-                        pseudo_styles.set(&pseudo, style.0);
+                    let style = self.cascade_style_and_visited(
+                        inputs,
+                        Some(primary_style.style()),
+                        layout_parent_style_for_pseudo,
+                        Some(&pseudo),
+                    );
+
+                    if !matches!(self.pseudo_resolution, PseudoElementResolution::Force)
+                        && eager_pseudo_is_definitely_not_generated(&pseudo, &style.0)
+                    {
+                        continue;
                     }
+
+                    pseudo_styles.set(&pseudo, style.0);
                 }
             }
+        }
 
-            ResolvedElementStyles {
-                primary: primary_style,
-                pseudos: pseudo_styles,
-            }
-        })
+        ResolvedElementStyles {
+            primary: primary_style,
+            pseudos: pseudo_styles,
+        }
     }
 
     fn resolve_pseudo_style(

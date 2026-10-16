@@ -246,6 +246,32 @@ pub struct PropertyDeclarationBlock {
     /// Set when a declaration is shared across elements and needs to be copied, even when not in
     /// the rule tree, e.g. via the style attribute or the XUL prototype caches.
     pub immutable: AtomicBool,
+
+    // Runtime-only proof of in-place CSSOM mutations; not declaration equality.
+    #[cfg(feature = "servo")]
+    background_color_mutations: BackgroundColorMutations,
+}
+
+#[cfg(feature = "servo")]
+#[derive(Debug, Default)]
+struct BackgroundColorMutations {
+    revision: u64,
+    last_unsupported: u64,
+    exhausted: bool,
+}
+
+#[cfg(feature = "servo")]
+impl BackgroundColorMutations {
+    fn note(&mut self, background_only: bool) {
+        let Some(revision) = self.revision.checked_add(1).filter(|_| !self.exhausted) else {
+            self.exhausted = true;
+            return;
+        };
+        self.revision = revision;
+        if !background_only {
+            self.last_unsupported = revision;
+        }
+    }
 }
 
 impl to_shmem::ToShmem for PropertyDeclarationBlock {
@@ -261,6 +287,8 @@ impl to_shmem::ToShmem for PropertyDeclarationBlock {
             declarations_importance: ManuallyDrop::into_inner(declarations_importance),
             property_ids: ManuallyDrop::into_inner(property_ids),
             immutable,
+            #[cfg(feature = "servo")]
+            background_color_mutations: BackgroundColorMutations::default(),
         }))
     }
 }
@@ -272,6 +300,8 @@ impl Clone for PropertyDeclarationBlock {
             declarations_importance: self.declarations_importance.clone(),
             property_ids: self.property_ids.clone(),
             immutable: AtomicBool::new(false),
+            #[cfg(feature = "servo")]
+            background_color_mutations: BackgroundColorMutations::default(),
         }
     }
 }
@@ -405,6 +435,22 @@ impl fmt::Debug for PropertyDeclarationBlock {
 }
 
 impl PropertyDeclarationBlock {
+    /// Current in-place mutation revision, or None after checked exhaustion.
+    #[cfg(feature = "servo")]
+    pub fn background_color_revision(&self) -> Option<u64> {
+        (!self.background_color_mutations.exhausted)
+            .then_some(self.background_color_mutations.revision)
+    }
+
+    /// Whether every mutation since an exact baseline replaced only one existing
+    /// normal, independent absolute background-color declaration in place.
+    #[cfg(feature = "servo")]
+    pub fn only_background_color_changes_since(&self, revision: u64) -> bool {
+        !self.background_color_mutations.exhausted
+            && revision >= self.background_color_mutations.last_unsupported
+            && revision < self.background_color_mutations.revision
+    }
+
     /// Returns the number of declarations in the block.
     #[inline]
     pub fn len(&self) -> usize {
@@ -425,6 +471,8 @@ impl PropertyDeclarationBlock {
             declarations_importance: SmallBitVec::new(),
             property_ids: PropertyDeclarationIdSet::default(),
             immutable: AtomicBool::new(false),
+            #[cfg(feature = "servo")]
+            background_color_mutations: BackgroundColorMutations::default(),
         }
     }
 
@@ -439,6 +487,8 @@ impl PropertyDeclarationBlock {
             declarations_importance: SmallBitVec::from_elem(1, importance.important()),
             property_ids,
             immutable: AtomicBool::new(false),
+            #[cfg(feature = "servo")]
+            background_color_mutations: BackgroundColorMutations::default(),
         }
     }
 
@@ -689,6 +739,8 @@ impl PropertyDeclarationBlock {
     ///
     /// This is only used for parsing and internal use.
     pub fn push(&mut self, declaration: PropertyDeclaration, importance: Importance) -> bool {
+        #[cfg(feature = "servo")]
+        self.background_color_mutations.note(false);
         let id = declaration.id();
         if !self.property_ids.insert(id) {
             let mut index_to_remove = None;
@@ -834,7 +886,22 @@ impl PropertyDeclarationBlock {
         updates: &mut SourcePropertyDeclarationUpdate,
     ) {
         let important = importance.important();
+        #[cfg(feature = "servo")]
+        let changed = updates
+            .updates
+            .iter()
+            .any(|update| *update != DeclarationUpdate::None);
+        #[cfg(feature = "servo")]
+        let mut background_only = !important
+            && matches!(drain.all_shorthand, AllShorthand::NotSet)
+            && drain.declarations.len() == 1
+            && updates.updates.len() == 1
+            && matches!(updates.updates[0], DeclarationUpdate::UpdateInPlace { pos }
+                if !self.declarations_importance[pos] &&
+                    independent_background_color(&self.declarations[pos]).is_some());
         if !matches!(drain.all_shorthand, AllShorthand::NotSet) {
+            #[cfg(feature = "servo")]
+            self.background_color_mutations.note(false);
             debug_assert!(updates.updates.is_empty());
             for decl in drain.all_shorthand.declarations() {
                 let id = decl.id();
@@ -904,6 +971,10 @@ impl PropertyDeclarationBlock {
         }
         // Execute updates and appends.
         for (decl, update) in drain.declarations.zip_eq(updates.updates.iter()) {
+            #[cfg(feature = "servo")]
+            {
+                background_only &= independent_background_color(&decl).is_some();
+            }
             match *update {
                 DeclarationUpdate::None => {},
                 DeclarationUpdate::Append | DeclarationUpdate::AppendAndRemove { .. } => {
@@ -916,6 +987,10 @@ impl PropertyDeclarationBlock {
                     self.declarations_importance.set(pos, important);
                 },
             }
+        }
+        #[cfg(feature = "servo")]
+        if changed {
+            self.background_color_mutations.note(background_only);
         }
         updates.updates.clear();
     }
@@ -938,6 +1013,8 @@ impl PropertyDeclarationBlock {
     /// Removes a given declaration at a given index.
     #[inline]
     fn remove_declaration_at(&mut self, i: usize) {
+        #[cfg(feature = "servo")]
+        self.background_color_mutations.note(false);
         self.property_ids.remove(self.declarations[i].id());
         self.declarations_importance.remove(i);
         self.declarations.remove(i);
@@ -946,6 +1023,8 @@ impl PropertyDeclarationBlock {
     /// Clears all the declarations from this block.
     #[inline]
     pub fn clear(&mut self) {
+        #[cfg(feature = "servo")]
+        self.background_color_mutations.note(false);
         self.declarations_importance.clear();
         self.declarations.clear();
         self.property_ids.clear();
@@ -1067,6 +1146,8 @@ impl PropertyDeclarationBlock {
             property_ids,
             declarations_importance: SmallBitVec::from_elem(len, false),
             immutable: AtomicBool::new(false),
+            #[cfg(feature = "servo")]
+            background_color_mutations: BackgroundColorMutations::default(),
         }
     }
 
@@ -1785,4 +1866,192 @@ pub fn parse_property_declaration_list(
     }
     parser.state.report_errors_if_needed(context, selectors);
     state.output_block
+}
+
+/// Extracts a context-independent absolute background-color declaration.
+#[cfg(feature = "servo")]
+pub fn independent_background_color(
+    declaration: &PropertyDeclaration,
+) -> Option<crate::color::AbsoluteColor> {
+    let PropertyDeclaration::BackgroundColor(color @ crate::values::specified::Color::Absolute(_)) =
+        declaration
+    else {
+        return None;
+    };
+    // Use the ordinary specified-to-computed normalization (missing components,
+    // Lab lightness and alpha included), never the raw parsed color payload.
+    match color.to_computed_color(None).ok()? {
+        crate::values::computed::Color::Absolute(color) => Some(color),
+        _ => None,
+    }
+}
+
+#[cfg(all(test, feature = "servo"))]
+mod inline_background_mutation_tests {
+    use super::*;
+    use crate::color::AbsoluteColor;
+    use crate::properties::{CSSWideKeyword, LonghandId};
+
+    fn color(red: u8) -> PropertyDeclaration {
+        PropertyDeclaration::BackgroundColor(AbsoluteColor::srgb_legacy(red, 0, 0, 1.).into())
+    }
+
+    fn update(
+        block: &mut PropertyDeclarationBlock,
+        declaration: PropertyDeclaration,
+        importance: Importance,
+    ) -> bool {
+        let mut source = SourcePropertyDeclaration::with_one(declaration);
+        let mut updates = SourcePropertyDeclarationUpdate::default();
+        let changed = block.prepare_for_update(&source, importance, &mut updates);
+        if changed {
+            block.update(source.drain(), importance, &mut updates);
+        }
+        changed
+    }
+
+    #[test]
+    fn inline_background_mutation_composes_only_existing_normal_absolute_updates() {
+        let mut block = PropertyDeclarationBlock::with_one(color(0), Importance::Normal);
+        let baseline = block.background_color_revision().unwrap();
+        assert!(update(&mut block, color(1), Importance::Normal));
+        assert!(update(&mut block, color(2), Importance::Normal));
+        assert!(block.only_background_color_changes_since(baseline));
+        assert!(block.only_background_color_changes_since(baseline + 1));
+        assert!(!block.only_background_color_changes_since(baseline + 2));
+    }
+
+    #[test]
+    fn inline_background_mutation_barrier_survives_later_supported_writes_and_recovers_after_full_baseline(
+    ) {
+        let mut block = PropertyDeclarationBlock::with_one(color(0), Importance::Normal);
+        let baseline = block.background_color_revision().unwrap();
+        update(&mut block, color(1), Importance::Normal);
+        update(
+            &mut block,
+            PropertyDeclaration::css_wide_keyword(LonghandId::Color, CSSWideKeyword::Initial),
+            Importance::Normal,
+        );
+        update(&mut block, color(2), Importance::Normal);
+        assert!(!block.only_background_color_changes_since(baseline));
+        let new_baseline = block.background_color_revision().unwrap();
+        update(&mut block, color(3), Importance::Normal);
+        assert!(block.only_background_color_changes_since(new_baseline));
+    }
+
+    #[test]
+    fn inline_background_mutation_priority_append_remove_clear_and_push_are_barriers() {
+        for operation in 0..7 {
+            let mut block = PropertyDeclarationBlock::with_one(color(0), Importance::Normal);
+            let baseline = block.background_color_revision().unwrap();
+            match operation {
+                0 => {
+                    update(&mut block, color(1), Importance::Important);
+                },
+                1 => {
+                    block.clear();
+                    update(&mut block, color(1), Importance::Normal);
+                },
+                2 => {
+                    let property = PropertyId::NonCustom(LonghandId::BackgroundColor.into());
+                    let first = block.first_declaration_to_remove(&property).unwrap();
+                    block.remove_property(&property, first);
+                    update(&mut block, color(1), Importance::Normal);
+                },
+                3 => {
+                    block.push(color(1), Importance::Normal);
+                },
+                4 => {
+                    let mut source = SourcePropertyDeclaration::with_one(color(1));
+                    block.extend(source.drain(), Importance::Normal);
+                },
+                5 => {
+                    let mut source = SourcePropertyDeclaration::default();
+                    source.all_shorthand = AllShorthand::CSSWideKeyword(CSSWideKeyword::Initial);
+                    let mut updates = SourcePropertyDeclarationUpdate::default();
+                    assert!(block.prepare_for_update(&source, Importance::Normal, &mut updates));
+                    block.update(source.drain(), Importance::Normal, &mut updates);
+                },
+                _ => {
+                    update(
+                        &mut block,
+                        PropertyDeclaration::css_wide_keyword(
+                            LonghandId::BackgroundColor,
+                            CSSWideKeyword::Inherit,
+                        ),
+                        Importance::Normal,
+                    );
+                },
+            }
+            update(&mut block, color(2), Importance::Normal);
+            assert!(
+                !block.only_background_color_changes_since(baseline),
+                "operation {operation}"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_background_mutation_noop_and_value_equality_ignore_runtime_metadata() {
+        let mut block = PropertyDeclarationBlock::with_one(color(0), Importance::Normal);
+        let baseline = block.background_color_revision().unwrap();
+        assert!(!update(&mut block, color(0), Importance::Normal));
+        assert_eq!(block.background_color_revision(), Some(baseline));
+        update(&mut block, color(1), Importance::Normal);
+        update(&mut block, color(0), Importance::Normal);
+        let cloned = block.clone();
+        assert!(cloned == block);
+        assert_eq!(cloned.background_color_revision(), Some(0));
+        assert!(!cloned.only_background_color_changes_since(baseline));
+    }
+
+    #[test]
+    fn inline_background_mutation_keyword_and_important_old_values_never_qualify() {
+        for old in [
+            PropertyDeclaration::BackgroundColor(crate::values::specified::Color::CurrentColor),
+            PropertyDeclaration::css_wide_keyword(
+                LonghandId::BackgroundColor,
+                CSSWideKeyword::Initial,
+            ),
+        ] {
+            let mut block = PropertyDeclarationBlock::with_one(old, Importance::Normal);
+            let baseline = block.background_color_revision().unwrap();
+            update(&mut block, color(1), Importance::Normal);
+            assert!(!block.only_background_color_changes_since(baseline));
+        }
+        let mut block = PropertyDeclarationBlock::with_one(color(0), Importance::Important);
+        let baseline = block.background_color_revision().unwrap();
+        update(&mut block, color(1), Importance::Normal);
+        assert!(!block.only_background_color_changes_since(baseline));
+    }
+
+    #[test]
+    fn inline_background_mutation_absolute_values_use_normal_computed_normalization() {
+        let mut absolute = AbsoluteColor::srgb_legacy(0, 0, 0, 1.);
+        absolute.flags = crate::color::ColorFlags::default();
+        absolute.components.0 = f32::NAN;
+        absolute.alpha = f32::NAN;
+        let specified: crate::values::specified::Color = absolute.into();
+        let expected = specified.to_computed_color(None).unwrap();
+        let declaration = PropertyDeclaration::BackgroundColor(specified);
+        let actual = independent_background_color(&declaration).unwrap();
+        assert_eq!(crate::values::computed::Color::Absolute(actual), expected);
+        assert!(!actual.components.0.is_nan());
+        assert!(!actual.alpha.is_nan());
+    }
+
+    #[test]
+    fn inline_background_mutation_checked_overflow_never_wraps_or_reenables() {
+        let mut block = PropertyDeclarationBlock::with_one(color(0), Importance::Normal);
+        block.background_color_mutations.revision = u64::MAX - 1;
+        block.background_color_mutations.last_unsupported = u64::MAX - 1;
+        update(&mut block, color(1), Importance::Normal);
+        assert!(block.only_background_color_changes_since(u64::MAX - 1));
+        update(&mut block, color(2), Importance::Normal);
+        assert_eq!(block.background_color_revision(), None);
+        update(&mut block, color(3), Importance::Normal);
+        block.clear();
+        assert!(!block.only_background_color_changes_since(0));
+        assert_eq!(block.background_color_revision(), None);
+    }
 }

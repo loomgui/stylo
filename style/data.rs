@@ -10,7 +10,7 @@ use crate::dom::TElement;
 use crate::invalidation::element::invalidator::InvalidationResult;
 use crate::invalidation::element::restyle_hints::RestyleHint;
 use crate::properties::ComputedValues;
-use crate::selector_parser::{PseudoElement, RestyleDamage, EAGER_PSEUDO_COUNT};
+use crate::selector_parser::{EAGER_PSEUDO_COUNT, PseudoElement, RestyleDamage};
 use crate::style_resolver::{PrimaryStyle, ResolvedElementStyles, ResolvedStyle};
 use crate::values::specified::TreeCountingFunction;
 #[cfg(feature = "gecko")]
@@ -297,6 +297,20 @@ pub struct ElementData {
 
     /// Flags.
     pub flags: ElementDataFlags,
+
+    /// Bounded prior successful cascade inputs for the narrow inline fast path.
+    #[cfg(feature = "servo")]
+    pub(crate) inline_background: Option<Box<crate::inline_background::InlineBackgroundBaseline>>,
+}
+
+/// A one-shot exact final-style pair, never inferred from coarse restyle damage.
+#[cfg(feature = "servo")]
+#[derive(Debug)]
+pub struct BackgroundColorChangeWitness {
+    /// The exact style before the successful incremental recascade.
+    pub old: Arc<ComputedValues>,
+    /// The exact style after normal final style/animation processing.
+    pub new: Arc<ComputedValues>,
 }
 
 /// A struct that wraps ElementData, giving it the ability of doing thread-safety checks.
@@ -373,7 +387,10 @@ impl<'a> DerefMut for ElementDataMut<'a> {
 }
 
 // There's one of these per rendered elements so it better be small.
+#[cfg(feature = "gecko")]
 size_of_test!(ElementData, 24);
+#[cfg(feature = "servo")]
+size_of_test!(ElementData, 32);
 
 /// The kind of restyle that a single element should do.
 #[derive(Debug)]
@@ -433,6 +450,13 @@ fn needs_to_recascade_self(hint: RestyleHint, style: &ComputedValues) -> bool {
 }
 
 impl ElementData {
+    /// Consume proof of the last incremental background-only style change.
+    /// Callers must match both Arc identities against their actual old/new styles.
+    #[cfg(feature = "servo")]
+    pub fn take_background_color_change_witness(&mut self) -> Option<BackgroundColorChangeWitness> {
+        self.inline_background.as_mut()?.take_witness()
+    }
+
     /// Invalidates style for this element, its descendants, and later siblings,
     /// based on the snapshot of the element that we took when attributes or
     /// state changed.

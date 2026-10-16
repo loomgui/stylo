@@ -2041,6 +2041,15 @@ impl ComputedValuesInner {
         })
     }
 
+    /// Mutate only a uniquely owned scratch Background allocation. This never
+    /// copies or mutates a shared style struct; the caller also owns the outer
+    /// ComputedValues uniquely and retains no published reference to it.
+    #[cfg(feature = "servo")]
+    #[inline]
+    pub(crate) fn try_mutate_unique_background(&mut self) -> Option<&mut style_structs::Background> {
+        Arc::get_mut(&mut self.background)
+    }
+
     /// Returns the visited style, if any.
     pub fn visited_style(&self) -> Option<&ComputedValues> {
         self.visited_style.as_deref()

@@ -146,7 +146,11 @@ where
     });
 
     // Collect statistics from thread-locals if requested.
-    if dump_stats || report_stats {
+    #[cfg(feature = "servo")]
+    let inline_background_count = traversal.shared_context().inline_background_count;
+    #[cfg(not(feature = "servo"))]
+    let inline_background_count: Option<&std::sync::atomic::AtomicU32> = None;
+    if dump_stats || report_stats || inline_background_count.is_some() {
         let mut aggregate = PerThreadTraversalStatistics::default();
         for slot in scoped_tls.slots() {
             if let Some(cx) = slot.get_mut() {
@@ -154,6 +158,12 @@ where
             }
         }
 
+        if let Some(counter) = inline_background_count {
+            counter.fetch_add(
+                aggregate.inline_background_color_recascades,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         if report_stats {
             report_statistics(&aggregate);
         }

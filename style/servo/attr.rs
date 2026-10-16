@@ -304,6 +304,49 @@ impl AttrValue {
         AttrValue::ShadowParts(string, shadow_parts)
     }
 
+    /// Clone an explicit detached Attr node without sharing its mutable inline
+    /// PDB. Match Element's existing clone fast path: preserve declaration kind,
+    /// stored lock and exact lazy serialization; other value kinds clone normally.
+    /// This is deliberately not AttrValue::Clone and adds no per-write copying.
+    pub fn clone_for_attribute_node(&self) -> Self {
+        match self {
+            Self::Declaration {
+                block,
+                lock,
+                serialization,
+            } => {
+                let cloned = block.read_with(&lock.read()).clone();
+                Self::Declaration {
+                    block: Arc::new(lock.wrap(cloned)),
+                    lock: lock.clone(),
+                    serialization: serialization.clone(),
+                }
+            },
+            _ => self.clone(),
+        }
+    }
+
+    /// Reset lazy serialization only for the exact in-place declaration block.
+    /// A live Attr keeps its identity; its next string read serializes current CSS.
+    pub fn invalidate_declaration_serialization(
+        &mut self,
+        expected: &Arc<Locked<PropertyDeclarationBlock>>,
+    ) -> bool {
+        let Self::Declaration {
+            block,
+            serialization,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        if !Arc::ptr_eq(block, expected) {
+            return false;
+        }
+        serialization.take();
+        true
+    }
+
     pub fn from_declaration(
         block: Arc<Locked<PropertyDeclarationBlock>>,
         lock: SharedRwLock,
@@ -711,4 +754,54 @@ pub struct AttrIdentifier {
     pub name: LocalName,
     pub namespace: Namespace,
     pub prefix: Option<Prefix>,
+}
+
+#[cfg(test)]
+mod unified_background_tests {
+    use super::*;
+    use crate::properties::{Importance, PropertyDeclaration};
+    #[test]
+    fn unified_background_live_serialization_reset_uses_exact_pdb_and_keeps_identity() {
+        let lock = SharedRwLock::new();
+        let mut pdb = PropertyDeclarationBlock::new();
+        pdb.push(
+            PropertyDeclaration::BackgroundColor(AbsoluteColor::BLACK.into()),
+            Importance::Normal,
+        );
+        let block = Arc::new(lock.wrap(pdb));
+        let mut attr = AttrValue::from_declaration(block.clone(), lock.clone());
+        let detached = attr.clone_for_attribute_node(); // Before either lazy string is read.
+        assert!(
+            matches!(&detached, AttrValue::Declaration { block: cloned, serialization, .. }
+            if !Arc::ptr_eq(cloned, &block) && serialization.get().is_none())
+        );
+        let before = String::from(&*attr);
+        {
+            let mut guard = lock.write();
+            block.write_with(&mut guard).push(
+                PropertyDeclaration::BackgroundColor(AbsoluteColor::WHITE.into()),
+                Importance::Normal,
+            );
+        }
+        assert_eq!(
+            &*attr, before,
+            "this exercises an already populated lazy cache"
+        );
+        let other = Arc::new(lock.wrap(PropertyDeclarationBlock::new()));
+        assert!(!attr.invalidate_declaration_serialization(&other));
+        assert_eq!(&*attr, before);
+        assert!(attr.invalidate_declaration_serialization(&block));
+        assert_ne!(&*attr, before);
+        assert_eq!(
+            &*detached, before,
+            "first clone read after original mutation remains independent"
+        );
+        assert!(
+            matches!(&attr, AttrValue::Declaration { block: live, .. } if Arc::ptr_eq(live, &block))
+        );
+        assert!(
+            attr.invalidate_declaration_serialization(&block),
+            "resetting an empty cache is safe"
+        );
+    }
 }
