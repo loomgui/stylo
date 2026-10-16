@@ -414,15 +414,75 @@ pub fn validate_background_style_before_drain<E: TElement>(
     Some(())
 }
 
-fn validate_background_style_inner<'a, E: TElement>(
+// These borrowed inputs keep the exact ElementData read borrow alive in the
+// caller. They contain no DOM node, Layout box, fragment, cache or mutable style.
+struct BackgroundStyleInputs<'a> {
+    data: &'a ElementData,
+    old: &'a Arc<ComputedValues>,
+    baseline: &'a InlineBackgroundBaseline,
+    epoch: u64,
+    viewport: Option<BackgroundViewportStamp>,
+}
+
+/// Non-authoritative captured inputs for pure preparation on an existing style
+/// worker. The private constructor performs every live DOM/parent/PDB identity
+/// check under the exclusive Layout guard; prepare still validates every current
+/// immutable style/property input. The caller retains its ElementData read guard
+/// and the author lock until all workers join, before any submit or commit.
+pub struct CapturedBackgroundStyle<'a> {
+    inputs: BackgroundStyleInputs<'a>,
+    reuse: Option<BackgroundStyleReuse>,
+}
+
+impl CapturedBackgroundStyle<'_> {
+    /// Prepare an eager style without accessing DOM, layout objects or caches.
+    /// A miss drops only retired scratch; the current style is never mutated.
+    pub fn prepare(self, guards: &StylesheetGuards) -> Option<PreparedBackgroundStyle> {
+        let Self { inputs, reuse } = self;
+        let validated = validate_background_style_inputs(&inputs, guards, reuse.as_ref())?;
+        Some(prepare_validated_style(
+            validated.old,
+            validated.baseline,
+            validated.revision,
+            validated.color,
+            reuse,
+        ))
+    }
+}
+
+/// Capture only while Layout owns the unchanged complete batch. This performs
+/// no hint/style mutation, allocation recycling or painter submission.
+pub fn capture_background_style_in_batch<'a, E: TElement>(
     context: &StyleContext<E>,
     element: E,
     data: &'a ElementData,
     expected_hint: RestyleHint,
-    reuse: Option<&BackgroundStyleReuse>,
+    reuse: Option<BackgroundStyleReuse>,
+    batch: &BackgroundBatchProof,
+    parent: &BackgroundParentProof,
+) -> Option<CapturedBackgroundStyle<'a>> {
+    if !batch.matches(context) {
+        return None;
+    }
+    let inputs = capture_background_style_inputs(
+        context,
+        element,
+        data,
+        expected_hint,
+        Some((batch, parent)),
+        BackgroundHintState::Applied,
+    )?;
+    Some(CapturedBackgroundStyle { inputs, reuse })
+}
+
+fn capture_background_style_inputs<'a, E: TElement>(
+    context: &StyleContext<E>,
+    element: E,
+    data: &'a ElementData,
+    expected_hint: RestyleHint,
     batch: Option<(&BackgroundBatchProof, &BackgroundParentProof)>,
     hint_state: BackgroundHintState,
-) -> Option<ValidatedBackgroundStyle<'a>> {
+) -> Option<BackgroundStyleInputs<'a>> {
     let epoch = context.shared.inline_background_epoch?;
     if expected_hint.bits() != RestyleHint::RESTYLE_STYLE_ATTRIBUTE.bits()
         || !hint_state.matches(data.hint, expected_hint)
@@ -442,6 +502,41 @@ fn validate_background_style_inner<'a, E: TElement>(
     let old = data.styles.primary.as_ref()?;
     let baseline = data.inline_background.as_ref()?;
     let viewport = batch.and_then(|(proof, _)| proof.viewport);
+    if let Some((_, parent)) = batch {
+        if !parent.matches(element, baseline) {
+            return None;
+        }
+    } else {
+        let (parent, parent_style) = parent(element)?;
+        if parent != baseline.parent || !Arc::ptr_eq(&parent_style, &baseline.parent_style) {
+            return None;
+        }
+    }
+    let declarations = element.style_attribute()?;
+    if !std::ptr::eq(&*declarations, &*baseline.declarations) {
+        return None;
+    }
+    Some(BackgroundStyleInputs {
+        data,
+        old,
+        baseline,
+        epoch,
+        viewport,
+    })
+}
+
+fn validate_background_style_inputs<'a>(
+    inputs: &BackgroundStyleInputs<'a>,
+    guards: &StylesheetGuards,
+    reuse: Option<&BackgroundStyleReuse>,
+) -> Option<ValidatedBackgroundStyle<'a>> {
+    let BackgroundStyleInputs {
+        data,
+        old,
+        baseline,
+        epoch,
+        viewport,
+    } = *inputs;
     // Always revalidate the stamp, including a cached-family hit. A query or
     // non-batch caller never receives viewport-dependent admission.
     if !viewport_matches_batch(baseline.viewport, viewport) {
@@ -458,21 +553,7 @@ fn validate_background_style_inner<'a, E: TElement>(
     if !same_selection(&data.styles.pseudos, selection) {
         return None;
     }
-    if let Some((_, parent)) = batch {
-        if !parent.matches(element, baseline) {
-            return None;
-        }
-    } else {
-        let (parent, parent_style) = parent(element)?;
-        if parent != baseline.parent || !Arc::ptr_eq(&parent_style, &baseline.parent_style) {
-            return None;
-        }
-    }
-    let declarations = element.style_attribute()?;
-    if !std::ptr::eq(&*declarations, &*baseline.declarations) {
-        return None;
-    }
-    let block = declarations.read_with(context.shared.guards.author);
+    let block = baseline.declarations.read_with(guards.author);
     if !block.only_background_color_changes_since(baseline.revision) {
         return None;
     }
@@ -497,6 +578,20 @@ fn validate_background_style_inner<'a, E: TElement>(
         revision,
         color,
     })
+}
+
+fn validate_background_style_inner<'a, E: TElement>(
+    context: &StyleContext<E>,
+    element: E,
+    data: &'a ElementData,
+    expected_hint: RestyleHint,
+    reuse: Option<&BackgroundStyleReuse>,
+    batch: Option<(&BackgroundBatchProof, &BackgroundParentProof)>,
+    hint_state: BackgroundHintState,
+) -> Option<ValidatedBackgroundStyle<'a>> {
+    let inputs =
+        capture_background_style_inputs(context, element, data, expected_hint, batch, hint_state)?;
+    validate_background_style_inputs(&inputs, &context.shared.guards, reuse)
 }
 
 fn prepare_background_style_inner<E: TElement>(
@@ -1077,6 +1172,329 @@ mod tests {
         )
     }
 
+    // These fixtures exercise the immutable worker proof after serial live-DOM
+    // capture. They do not manufacture a DOM/environment or painter capability.
+    fn pending_parallel_fixture(lock: &SharedRwLock, index: usize) -> ElementData {
+        let tree = RuleTree::new();
+        let rules = tree.insert_ordered_rules(
+            [(source(lock, "color:black"), priority(CascadeOrigin::UA))].into_iter(),
+        );
+        let mut data = reuse_fixture();
+        let old = values(AbsoluteColor::BLACK, Some(rules), false);
+        data.styles.primary = Some(old.clone());
+        data.hint = RestyleHint::RESTYLE_STYLE_ATTRIBUTE;
+        let declarations = Arc::new(lock.wrap(PropertyDeclarationBlock::with_one(
+            PropertyDeclaration::BackgroundColor(AbsoluteColor::BLACK.into()),
+            Importance::Normal,
+        )));
+        let revision = declarations
+            .read_with(&lock.read())
+            .background_color_revision()
+            .unwrap();
+        let baseline = data.inline_background.as_mut().unwrap();
+        baseline.style = old;
+        baseline.declarations = declarations.clone();
+        baseline.revision = revision;
+        let mut declaration = crate::properties::SourcePropertyDeclaration::with_one(
+            PropertyDeclaration::BackgroundColor(parallel_fixture_color(index).into()),
+        );
+        let mut updates = Default::default();
+        let mut guard = lock.write();
+        let block = declarations.write_with(&mut guard);
+        assert!(block.prepare_for_update(&declaration, Importance::Normal, &mut updates));
+        block.update(declaration.drain(), Importance::Normal, &mut updates);
+        data
+    }
+
+    fn parallel_fixture_color(index: usize) -> AbsoluteColor {
+        AbsoluteColor::srgb_legacy((index % 256) as u8, ((index * 7) % 256) as u8, 255, 1.)
+    }
+
+    fn captured_fixture(data: &ElementData) -> CapturedBackgroundStyle<'_> {
+        CapturedBackgroundStyle {
+            inputs: BackgroundStyleInputs {
+                data,
+                old: data.styles.primary.as_ref().unwrap(),
+                baseline: data.inline_background.as_ref().unwrap(),
+                epoch: 4,
+                viewport: None,
+            },
+            reuse: None,
+        }
+    }
+
+    #[test]
+    fn parallel_background_inputs_use_existing_send_sync_contracts() {
+        fn send<T: Send>() {}
+        fn sync<T: Sync>() {}
+        send::<CapturedBackgroundStyle<'_>>();
+        send::<PreparedBackgroundStyle>();
+        sync::<ElementData>();
+        sync::<StylesheetGuards<'_>>();
+    }
+
+    #[test]
+    fn parallel_background_preparation_matches_serial_order_and_preserves_held_styles() {
+        use rayon::prelude::*;
+        let lock = SharedRwLock::new();
+        let data: Vec<_> = (0..128)
+            .map(|index| pending_parallel_fixture(&lock, index))
+            .collect();
+        let held: Vec<_> = data
+            .iter()
+            .map(|data| data.styles.primary.as_ref().unwrap().clone())
+            .collect();
+        // Sharing a Background style struct must not authorize in-place writes.
+        let shared_backgrounds: Vec<_> = held.iter().map(|old| Arc::new((**old).clone())).collect();
+        let guard = lock.read();
+        let guards = StylesheetGuards {
+            author: &guard,
+            ua_or_user: &guard,
+        };
+        let serial: Vec<_> = data
+            .iter()
+            .map(|data| captured_fixture(data).prepare(&guards).unwrap())
+            .collect();
+        let inputs: Vec<_> = data.iter().map(captured_fixture).collect();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(3)
+            .build()
+            .unwrap();
+        let parallel: Vec<_> = pool
+            .install(|| {
+                inputs
+                    .into_par_iter()
+                    .map(|input| input.prepare(&guards))
+                    .collect::<Option<Vec<_>>>()
+            })
+            .unwrap();
+        for (index, ((serial, parallel), data)) in
+            serial.iter().zip(&parallel).zip(&data).enumerate()
+        {
+            assert!(Arc::ptr_eq(serial.old_primary(), parallel.old_primary()));
+            assert_eq!(
+                parallel.new_primary().get_background().background_color,
+                Color::Absolute(parallel_fixture_color(index))
+            );
+            assert_eq!(
+                serial.new_primary().get_background().background_color,
+                parallel.new_primary().get_background().background_color
+            );
+            assert!(
+                parallel
+                    .old_primary()
+                    .same_except_background_color(parallel.new_primary())
+            );
+            assert!(Arc::ptr_eq(
+                data.styles.primary.as_ref().unwrap(),
+                &held[index]
+            ));
+            assert_eq!(
+                held[index].get_background().background_color,
+                Color::Absolute(AbsoluteColor::BLACK)
+            );
+            assert_eq!(
+                shared_backgrounds[index].get_background().background_color,
+                Color::Absolute(AbsoluteColor::BLACK)
+            );
+            assert_eq!(
+                data.hint.bits(),
+                RestyleHint::RESTYLE_STYLE_ATTRIBUTE.bits()
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_background_cached_reuse_preserves_aliased_spares_until_commit() {
+        use rayon::prelude::*;
+        let lock = SharedRwLock::new();
+        let mut data: Vec<_> = (0..64)
+            .map(|index| pending_parallel_fixture(&lock, index))
+            .collect();
+        let reuse: Vec<_> = {
+            let guard = lock.read();
+            let guards = StylesheetGuards {
+                author: &guard,
+                ua_or_user: &guard,
+            };
+            data.iter_mut()
+                .map(|data| {
+                    let prepared = captured_fixture(data).prepare(&guards).unwrap();
+                    commit_background_style(data, prepared)
+                })
+                .collect()
+        };
+        let held_spares: Vec<_> = reuse.iter().map(|reuse| reuse.spare.clone()).collect();
+        {
+            let mut guard = lock.write();
+            for data in &mut data {
+                data.hint = RestyleHint::RESTYLE_STYLE_ATTRIBUTE;
+                let block = data
+                    .inline_background
+                    .as_ref()
+                    .unwrap()
+                    .declarations
+                    .write_with(&mut guard);
+                let mut declaration = crate::properties::SourcePropertyDeclaration::with_one(
+                    PropertyDeclaration::BackgroundColor(AbsoluteColor::WHITE.into()),
+                );
+                let mut updates = Default::default();
+                assert!(block.prepare_for_update(&declaration, Importance::Normal, &mut updates));
+                block.update(declaration.drain(), Importance::Normal, &mut updates);
+            }
+        }
+        let held_current: Vec<_> = data
+            .iter()
+            .map(|data| data.styles.primary.as_ref().unwrap().clone())
+            .collect();
+        let guard = lock.read();
+        let guards = StylesheetGuards {
+            author: &guard,
+            ua_or_user: &guard,
+        };
+        let inputs: Vec<_> = data
+            .iter()
+            .zip(reuse)
+            .map(|(data, reuse)| {
+                let mut input = captured_fixture(data);
+                input.reuse = Some(reuse);
+                input
+            })
+            .collect();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(3)
+            .build()
+            .unwrap();
+        let prepared = pool
+            .install(|| {
+                inputs
+                    .into_par_iter()
+                    .map(|input| input.prepare(&guards))
+                    .collect::<Option<Vec<_>>>()
+            })
+            .unwrap();
+        for (index, prepared) in prepared.iter().enumerate() {
+            assert!(prepared.used_cached_family());
+            assert_eq!(
+                prepared.new_primary().get_background().background_color,
+                Color::Absolute(AbsoluteColor::WHITE)
+            );
+            assert!(
+                prepared
+                    .old_primary()
+                    .same_except_background_color(prepared.new_primary())
+            );
+            assert!(Arc::ptr_eq(
+                data[index].styles.primary.as_ref().unwrap(),
+                &held_current[index]
+            ));
+            assert_eq!(
+                held_current[index].get_background().background_color,
+                Color::Absolute(parallel_fixture_color(index))
+            );
+            assert_eq!(
+                held_spares[index].get_background().background_color,
+                Color::Absolute(AbsoluteColor::BLACK)
+            );
+        }
+        drop(prepared); // An abandoned batch never changes either published side.
+        for (index, data) in data.iter().enumerate() {
+            assert!(Arc::ptr_eq(
+                data.styles.primary.as_ref().unwrap(),
+                &held_current[index]
+            ));
+            assert_eq!(
+                held_spares[index].get_background().background_color,
+                Color::Absolute(AbsoluteColor::BLACK)
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_background_late_invalid_property_rejects_whole_batch_without_commit() {
+        use rayon::prelude::*;
+        let lock = SharedRwLock::new();
+        let data: Vec<_> = (0..128)
+            .map(|index| pending_parallel_fixture(&lock, index))
+            .collect();
+        let held: Vec<_> = data
+            .iter()
+            .map(|data| data.styles.primary.as_ref().unwrap().clone())
+            .collect();
+        {
+            let mut guard = lock.write();
+            data.last()
+                .unwrap()
+                .inline_background
+                .as_ref()
+                .unwrap()
+                .declarations
+                .write_with(&mut guard)
+                .push(
+                    PropertyDeclaration::BackgroundColor(AbsoluteColor::WHITE.into()),
+                    Importance::Important,
+                );
+        }
+        let guard = lock.read();
+        let guards = StylesheetGuards {
+            author: &guard,
+            ua_or_user: &guard,
+        };
+        let inputs: Vec<_> = data.iter().map(captured_fixture).collect();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(3)
+            .build()
+            .unwrap();
+        let prepared = pool.install(|| {
+            inputs
+                .into_par_iter()
+                .map(|input| input.prepare(&guards))
+                .collect::<Option<Vec<_>>>()
+        });
+        assert!(prepared.is_none());
+        for (data, held) in data.iter().zip(&held) {
+            assert!(Arc::ptr_eq(data.styles.primary.as_ref().unwrap(), held));
+            assert_eq!(
+                held.get_background().background_color,
+                Color::Absolute(AbsoluteColor::BLACK)
+            );
+            assert_eq!(
+                data.hint.bits(),
+                RestyleHint::RESTYLE_STYLE_ATTRIBUTE.bits()
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_background_pure_proof_retains_epoch_primary_selection_and_viewport_guards() {
+        let lock = SharedRwLock::new();
+        for invalid in 0..4 {
+            let mut data = pending_parallel_fixture(&lock, 0);
+            match invalid {
+                0 => data.inline_background.as_mut().unwrap().epoch += 1,
+                1 => {
+                    data.styles.primary =
+                        Some(Arc::new((**data.styles.primary.as_ref().unwrap()).clone()))
+                },
+                2 => data.styles.pseudos = EagerPseudoStyles::default(),
+                3 => {
+                    data.inline_background.as_mut().unwrap().viewport =
+                        BackgroundViewportStamp::from_values(4, [800., 600., 800., 600., 1.])
+                },
+                _ => unreachable!(),
+            }
+            let guard = lock.read();
+            let guards = StylesheetGuards {
+                author: &guard,
+                ua_or_user: &guard,
+            };
+            assert!(
+                captured_fixture(&data).prepare(&guards).is_none(),
+                "guard {invalid}"
+            );
+        }
+    }
+
     fn cv_identity(style: &Arc<ComputedValues>) -> *const ComputedValues {
         &**style
     }
@@ -1405,6 +1823,7 @@ mod layout_attribution {
         ack: Option<bool>,
         samples: Samples,
         sampling_enabled: bool,
+        parallel_preparation: bool,
     }
     /// Diagnostic guard returned through the existing prepared-style API.
     pub struct Guard {
@@ -1454,6 +1873,7 @@ mod layout_attribution {
             ack: None,
             samples: Samples::default(),
             sampling_enabled: false,
+            parallel_preparation: false,
         };
         CONTEXT.with(|stack| stack.borrow_mut().push(context));
         Guard {
@@ -1469,6 +1889,12 @@ mod layout_attribution {
             let Some(c) = stack.last_mut() else {
                 return;
             };
+            if name == "parallel_prepare" {
+                // Worker tokens have no caller TLS context. Coarse batch marks
+                // remain complete; absent fine samples are not zero work.
+                c.parallel_preparation = true;
+                return;
+            }
             let slot = match name {
                 "capture_begin" => 0,
                 "prepare_begin" => 1,
@@ -1552,7 +1978,7 @@ mod layout_attribution {
             }
             let m = c.marks;
             println!(
-                "[PERF] CertifiedLayoutProbe ordinal={} thread={:?} pipeline={:?} epoch={:?} goal={:?} restyle={} pending={} nonempty_ordinal={} companion_on_entry={} admission_slow={} accepted_ordinal={:?} accepted_nodes={} utc_begin_us={} utc_end_us={} whole_ms={:.6} pre_prepare_ms={:?} overall_stage_guard_release_ms={:?} owner_tail_request_drop_ms={:?} entry_to_capture_ms={:?} capture_environment_ms={:?} input_prepare_ms={:?} guard_release_ms={:?} pre_ack_ms={:?} ack_ms={:?} ack_result={:?} commit_cleanup_ms={:?} accepted_tail_ms={:?} handle_request_drop_tail_ms={:?} attempt={:?} sample_offset={:?} sampling_enabled_on_attempt={} target_calls={} sampled_calls={} sampled_prepared={} sampled_rejected={} sample_proof_sum_ms={:.6} sample_build_sum_ms={:.6} sample_total_sum_ms={:.6} sample_kind=deterministic_rotating_1of64 sample_extrapolation=none emitted_asof={} eligible_asof={} omitted_asof={} requests_asof={} lost_asof={}",
+                "[PERF] CertifiedLayoutProbe ordinal={} thread={:?} pipeline={:?} epoch={:?} goal={:?} restyle={} pending={} nonempty_ordinal={} companion_on_entry={} admission_slow={} accepted_ordinal={:?} accepted_nodes={} utc_begin_us={} utc_end_us={} whole_ms={:.6} pre_prepare_ms={:?} overall_stage_guard_release_ms={:?} owner_tail_request_drop_ms={:?} entry_to_capture_ms={:?} capture_environment_ms={:?} input_prepare_ms={:?} guard_release_ms={:?} pre_ack_ms={:?} ack_ms={:?} ack_result={:?} commit_cleanup_ms={:?} accepted_tail_ms={:?} handle_request_drop_tail_ms={:?} attempt={:?} sample_offset={:?} sampling_enabled_on_attempt={} target_sampling_available={} target_calls={} sampled_calls={} sampled_prepared={} sampled_rejected={} sample_proof_sum_ms={:.6} sample_build_sum_ms={:.6} sample_total_sum_ms={:.6} sample_kind=deterministic_rotating_1of64 sample_extrapolation=none emitted_asof={} eligible_asof={} omitted_asof={} requests_asof={} lost_asof={}",
                 c.ordinal,
                 std::thread::current().id(),
                 c.pipeline,
@@ -1584,6 +2010,7 @@ mod layout_attribution {
                 c.attempt,
                 c.attempt.map(|n| n % 64),
                 c.sampling_enabled,
+                !c.parallel_preparation,
                 c.samples.targets,
                 c.samples.sampled,
                 c.samples.prepared,

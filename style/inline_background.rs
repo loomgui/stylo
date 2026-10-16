@@ -24,8 +24,9 @@ use servo_arc::Arc;
 
 mod batch;
 pub use self::batch::{
-    BackgroundBatchProof, BackgroundParentProof, BackgroundStyleReuse, PreparedBackgroundStyle,
-    commit_background_style, prepare_background_style, prepare_background_style_in_batch,
+    BackgroundBatchProof, BackgroundParentProof, BackgroundStyleReuse, CapturedBackgroundStyle,
+    PreparedBackgroundStyle, capture_background_style_in_batch, commit_background_style,
+    prepare_background_style, prepare_background_style_in_batch,
     prepare_background_style_with_reuse, validate_background_style_before_drain,
 };
 
