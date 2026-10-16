@@ -11,7 +11,7 @@ use crate::data::{EagerPseudoStyles, ElementData};
 use crate::dom::{OpaqueNode, TElement, TNode};
 use crate::invalidation::element::restyle_hints::RestyleHint;
 use crate::properties::cascade::normal_inline_background_wins;
-use crate::properties::declaration_block::{independent_background_color, Importance};
+use crate::properties::declaration_block::{Importance, independent_background_color};
 use crate::properties::{
     ComputedValues, LonghandId, PropertyDeclarationBlock, PropertyDeclarationId,
 };
@@ -24,9 +24,9 @@ use servo_arc::Arc;
 
 mod batch;
 pub use self::batch::{
+    BackgroundBatchProof, BackgroundParentProof, BackgroundStyleReuse, PreparedBackgroundStyle,
     commit_background_style, prepare_background_style, prepare_background_style_in_batch,
-    prepare_background_style_with_reuse, BackgroundBatchProof, BackgroundParentProof,
-    BackgroundStyleReuse, PreparedBackgroundStyle,
+    prepare_background_style_with_reuse, validate_background_style_before_drain,
 };
 
 /// One bounded successful baseline per element, never embedded in ComputedValues.
@@ -294,10 +294,16 @@ pub(crate) fn record_final<E: TElement>(
         }
     }
     let create = || -> Option<InlineBackgroundBaseline> {
-        let epoch = context.shared.inline_background_epoch?;
+        let epoch = context
+            .shared
+            .inline_background_epoch
+            .or(context.shared.inline_background_record_epoch)?;
         let style = data.styles.primary.as_ref()?;
         let viewport = if style.flags.contains(Flags::USES_VIEWPORT_UNITS) {
-            Some(BackgroundViewportStamp::capture(context)?)
+            Some(BackgroundViewportStamp::for_device(
+                epoch,
+                context.shared.stylist.device(),
+            )?)
         } else {
             None
         };

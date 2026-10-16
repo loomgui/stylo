@@ -366,18 +366,66 @@ fn supported_style_for_batch(
             && supported_viewport_batch_inputs(style))
 }
 
-fn prepare_background_style_inner<E: TElement>(
+#[derive(Clone, Copy)]
+enum BackgroundHintState {
+    Applied,
+    BeforeDrain,
+}
+
+impl BackgroundHintState {
+    fn matches(self, actual: RestyleHint, expected: RestyleHint) -> bool {
+        match self {
+            Self::Applied => actual.bits() == expected.bits(),
+            Self::BeforeDrain => actual.is_empty(),
+        }
+    }
+}
+
+struct ValidatedBackgroundStyle<'a> {
+    old: &'a Arc<ComputedValues>,
+    baseline: &'a InlineBackgroundBaseline,
+    revision: u64,
+    color: crate::color::AbsoluteColor,
+}
+
+/// Pure current-style/property proof for an internal focus-fixup read only.
+/// The caller validates the complete pending list and its clean ancestry before
+/// calling this. No hint, style, baseline, cache allocation or paint is changed.
+/// This is deliberately not a query recascade or a retained-paint capability.
+pub fn validate_background_style_before_drain<E: TElement>(
     context: &StyleContext<E>,
     element: E,
     data: &ElementData,
+    batch: &BackgroundBatchProof,
+    parent: &BackgroundParentProof,
+) -> Option<()> {
+    if !batch.matches(context) {
+        return None;
+    }
+    validate_background_style_inner(
+        context,
+        element,
+        data,
+        RestyleHint::RESTYLE_STYLE_ATTRIBUTE,
+        None,
+        Some((batch, parent)),
+        BackgroundHintState::BeforeDrain,
+    )?;
+    Some(())
+}
+
+fn validate_background_style_inner<'a, E: TElement>(
+    context: &StyleContext<E>,
+    element: E,
+    data: &'a ElementData,
     expected_hint: RestyleHint,
-    reuse: Option<BackgroundStyleReuse>,
+    reuse: Option<&BackgroundStyleReuse>,
     batch: Option<(&BackgroundBatchProof, &BackgroundParentProof)>,
-) -> Option<PreparedBackgroundStyle> {
-    let mut attribution_sample = layout_attribution::Sample::begin();
+    hint_state: BackgroundHintState,
+) -> Option<ValidatedBackgroundStyle<'a>> {
     let epoch = context.shared.inline_background_epoch?;
     if expected_hint.bits() != RestyleHint::RESTYLE_STYLE_ATTRIBUTE.bits()
-        || data.hint.bits() != expected_hint.bits()
+        || !hint_state.matches(data.hint, expected_hint)
         || !data.damage.is_empty()
         || element.as_node().first_child().is_some()
         || element.shadow_root().is_some()
@@ -399,9 +447,7 @@ fn prepare_background_style_inner<E: TElement>(
     if !viewport_matches_batch(baseline.viewport, viewport) {
         return None;
     }
-    let same_family = reuse
-        .as_ref()
-        .is_some_and(|reuse| reuse.matches(old, baseline));
+    let same_family = reuse.is_some_and(|reuse| reuse.matches(old, baseline));
     if baseline.epoch != epoch
         || !Arc::ptr_eq(old, &baseline.style)
         || (!same_family && !supported_style_for_batch(old, baseline.viewport, viewport))
@@ -445,8 +491,40 @@ fn prepare_background_style_inner<E: TElement>(
     // The final baseline proved the actual normal-inline winner. The same PDB
     // identity and supported mutation range preserve its priority and all other
     // declarations; parent/sheet/environment identity preserves the rule graph.
+    Some(ValidatedBackgroundStyle {
+        old,
+        baseline,
+        revision,
+        color,
+    })
+}
+
+fn prepare_background_style_inner<E: TElement>(
+    context: &StyleContext<E>,
+    element: E,
+    data: &ElementData,
+    expected_hint: RestyleHint,
+    reuse: Option<BackgroundStyleReuse>,
+    batch: Option<(&BackgroundBatchProof, &BackgroundParentProof)>,
+) -> Option<PreparedBackgroundStyle> {
+    let mut attribution_sample = layout_attribution::Sample::begin();
+    let validated = validate_background_style_inner(
+        context,
+        element,
+        data,
+        expected_hint,
+        reuse.as_ref(),
+        batch,
+        BackgroundHintState::Applied,
+    )?;
     attribution_sample.build_started();
-    let prepared = prepare_validated_style(old, baseline, revision, color, reuse);
+    let prepared = prepare_validated_style(
+        validated.old,
+        validated.baseline,
+        validated.revision,
+        validated.color,
+        reuse,
+    );
     attribution_sample.prepared();
     Some(prepared)
 }
@@ -544,7 +622,7 @@ mod tests {
     use crate::applicable_declarations::CascadePriority;
     use crate::color::AbsoluteColor;
     use crate::properties::style_structs::Font;
-    use crate::properties::{parse_style_attribute, PropertyDeclaration};
+    use crate::properties::{PropertyDeclaration, parse_style_attribute};
     use crate::rule_tree::{CascadeLevel, RuleCascadeFlags, RuleTree, StrongRuleNode, StyleSource};
     use crate::shared_lock::SharedRwLock;
     use crate::stylesheets::layer_rule::LayerOrder;
@@ -566,6 +644,17 @@ mod tests {
         values.rules = rules;
         values.mutate_background().background_color = Color::Absolute(color);
         Arc::new(values)
+    }
+
+    #[test]
+    fn focus_background_proof_requires_clean_predrain_hint_without_relaxing_applied_hint() {
+        let style = RestyleHint::RESTYLE_STYLE_ATTRIBUTE;
+        assert!(BackgroundHintState::BeforeDrain.matches(RestyleHint::empty(), style));
+        assert!(!BackgroundHintState::BeforeDrain.matches(style, style));
+        assert!(!BackgroundHintState::BeforeDrain.matches(RestyleHint::RESTYLE_SELF, style));
+        assert!(BackgroundHintState::Applied.matches(style, style));
+        assert!(!BackgroundHintState::Applied.matches(RestyleHint::empty(), style));
+        assert!(!BackgroundHintState::Applied.matches(style | RestyleHint::RESTYLE_SELF, style));
     }
 
     fn viewport_test_style(extra: Flags) -> Arc<ComputedValues> {
@@ -733,18 +822,21 @@ mod tests {
         baseline.epoch = 8;
         baseline.viewport = Some(renewed);
         let prepared = stage_reuse(&data, AbsoluteColor::WHITE, None);
-        assert!(prepared
-            .new_primary()
-            .flags
-            .contains(Flags::USES_VIEWPORT_UNITS));
+        assert!(
+            prepared
+                .new_primary()
+                .flags
+                .contains(Flags::USES_VIEWPORT_UNITS)
+        );
         let reuse = commit_background_style(&mut data, prepared);
-        assert!(data
-            .styles
-            .primary
-            .as_ref()
-            .unwrap()
-            .flags
-            .contains(Flags::USES_VIEWPORT_UNITS));
+        assert!(
+            data.styles
+                .primary
+                .as_ref()
+                .unwrap()
+                .flags
+                .contains(Flags::USES_VIEWPORT_UNITS)
+        );
         assert_eq!(reuse.family.viewport, Some(renewed));
         assert_eq!(
             data.inline_background.as_ref().unwrap().viewport,
@@ -1006,9 +1098,10 @@ mod tests {
         assert!(!reuse.matches_primary_selection(current, &selected_alias, Some(4)));
         let hot = stage_reuse(&data, AbsoluteColor::BLACK, Some(reuse));
         assert!(hot.used_cached_family());
-        assert!(hot
-            .old_primary()
-            .same_except_background_color(hot.new_primary()));
+        assert!(
+            hot.old_primary()
+                .same_except_background_color(hot.new_primary())
+        );
     }
 
     #[test]
@@ -1029,9 +1122,11 @@ mod tests {
         ] {
             let prepared = stage_reuse(&data, color, Some(reuse));
             assert_eq!(cv_identity(prepared.new_primary()), expected);
-            assert!(prepared
-                .old_primary()
-                .same_except_background_color(prepared.new_primary()));
+            assert!(
+                prepared
+                    .old_primary()
+                    .same_except_background_color(prepared.new_primary())
+            );
             assert_eq!(
                 prepared.new_primary().get_background().background_color,
                 Color::Absolute(color)
@@ -1070,10 +1165,12 @@ mod tests {
             };
             assert_eq!(Arc::get_mut(&mut reuse.spare).is_none(), shared_outer);
             if !shared_outer {
-                assert!(Arc::get_mut(&mut reuse.spare)
-                    .unwrap()
-                    .try_mutate_unique_background()
-                    .is_none());
+                assert!(
+                    Arc::get_mut(&mut reuse.spare)
+                        .unwrap()
+                        .try_mutate_unique_background()
+                        .is_none()
+                );
             }
             let old_background = external.get_background() as *const _;
             let prepared = stage_reuse(&data, AbsoluteColor::WHITE, Some(reuse));
@@ -1090,9 +1187,11 @@ mod tests {
                 prepared.new_primary().get_background().background_color,
                 Color::Absolute(AbsoluteColor::WHITE)
             );
-            assert!(prepared
-                .old_primary()
-                .same_except_background_color(prepared.new_primary()));
+            assert!(
+                prepared
+                    .old_primary()
+                    .same_except_background_color(prepared.new_primary())
+            );
             let reuse = commit_background_style(&mut data, prepared);
             drop(external);
             // A miss still establishes a valid next committed pair.
@@ -1147,9 +1246,11 @@ mod tests {
             // Missing Selection is rejected by the public proof before this helper.
             if mismatch != 6 {
                 let prepared = stage_reuse(&data, AbsoluteColor::WHITE, Some(reuse));
-                assert!(prepared
-                    .old_primary()
-                    .same_except_background_color(prepared.new_primary()));
+                assert!(
+                    prepared
+                        .old_primary()
+                        .same_except_background_color(prepared.new_primary())
+                );
                 if mismatch == 7 {
                     assert_eq!(prepared.new_primary().get_effects().opacity, 0.5);
                 }
@@ -1158,8 +1259,8 @@ mod tests {
     }
 
     #[test]
-    fn eager_background_reuse_abandon_keeps_authority_and_commit_retains_baseline_pseudos_and_flags(
-    ) {
+    fn eager_background_reuse_abandon_keeps_authority_and_commit_retains_baseline_pseudos_and_flags()
+     {
         let blue = AbsoluteColor::srgb_legacy(0, 0, 255, 1.);
         let mut data = reuse_fixture();
         let baseline_address = &**data.inline_background.as_ref().unwrap() as *const _;
@@ -1189,9 +1290,11 @@ mod tests {
             data.styles.pseudos.get(&PseudoElement::Selection).unwrap(),
             &selected
         ));
-        assert!(!data
-            .flags
-            .contains(crate::data::ElementDataFlags::PRIMARY_STYLE_REUSED_VIA_RULE_NODE));
+        assert!(
+            !data
+                .flags
+                .contains(crate::data::ElementDataFlags::PRIMARY_STYLE_REUSED_VIA_RULE_NODE)
+        );
         assert!(data.is_restyle() && data.hint.is_empty() && data.damage.is_empty());
         assert_eq!(data.inline_background.as_ref().unwrap().revision, 2);
         assert!(data.inline_background.as_ref().unwrap().previous.is_none());
@@ -1230,8 +1333,8 @@ mod tests {
 mod layout_attribution {
     use std::cell::RefCell;
     use std::fmt::Debug;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     const CAP: u64 = 64;
@@ -1439,17 +1542,61 @@ mod layout_attribution {
             if slot.is_err() {
                 let omitted = OMITTED.fetch_add(1, Ordering::Relaxed) + 1;
                 if omitted == 1 {
-                    println!("[PERF] CertifiedLayoutProbeCap cap={CAP} eligible_asof={eligible} omitted_asof={omitted} requests_asof={} lost_asof={} tail_coverage=unknown", REQUESTS.load(Ordering::Relaxed), LOST.load(Ordering::Relaxed));
+                    println!(
+                        "[PERF] CertifiedLayoutProbeCap cap={CAP} eligible_asof={eligible} omitted_asof={omitted} requests_asof={} lost_asof={} tail_coverage=unknown",
+                        REQUESTS.load(Ordering::Relaxed),
+                        LOST.load(Ordering::Relaxed)
+                    );
                 }
                 return;
             }
             let m = c.marks;
-            println!("[PERF] CertifiedLayoutProbe ordinal={} thread={:?} pipeline={:?} epoch={:?} goal={:?} restyle={} pending={} nonempty_ordinal={} companion_on_entry={} admission_slow={} accepted_ordinal={:?} accepted_nodes={} utc_begin_us={} utc_end_us={} whole_ms={:.6} pre_prepare_ms={:?} overall_stage_guard_release_ms={:?} owner_tail_request_drop_ms={:?} entry_to_capture_ms={:?} capture_environment_ms={:?} input_prepare_ms={:?} guard_release_ms={:?} pre_ack_ms={:?} ack_ms={:?} ack_result={:?} commit_cleanup_ms={:?} accepted_tail_ms={:?} handle_request_drop_tail_ms={:?} attempt={:?} sample_offset={:?} sampling_enabled_on_attempt={} target_calls={} sampled_calls={} sampled_prepared={} sampled_rejected={} sample_proof_sum_ms={:.6} sample_build_sum_ms={:.6} sample_total_sum_ms={:.6} sample_kind=deterministic_rotating_1of64 sample_extrapolation=none emitted_asof={} eligible_asof={} omitted_asof={} requests_asof={} lost_asof={}",
-                c.ordinal, std::thread::current().id(), c.pipeline, c.epoch, c.goal, c.has_restyle, c.pending, c.nonempty, c.companion, elapsed_ms >= 5.0, c.accepted, c.nodes, c.utc_start, utc_end, elapsed_ms,
-                between(Some(c.start),m[1]), between(m[1],m[3]), between(m[6],Some(end)),
-                between(Some(c.start),m[0]), between(m[0],m[1]), between(m[1],m[2]), between(m[2],m[3]), between(m[3],m[4]), between(m[4],m[5]), c.ack,
-                between(m[5],m[6]), between(m[6],m[7]), between(m[7],Some(end)), c.attempt, c.attempt.map(|n| n % 64), c.sampling_enabled, c.samples.targets, c.samples.sampled, c.samples.prepared, c.samples.rejected, c.samples.proof_ms, c.samples.build_ms, c.samples.total_ms,
-                slot.unwrap() + 1, eligible, OMITTED.load(Ordering::Relaxed), REQUESTS.load(Ordering::Relaxed), LOST.load(Ordering::Relaxed));
+            println!(
+                "[PERF] CertifiedLayoutProbe ordinal={} thread={:?} pipeline={:?} epoch={:?} goal={:?} restyle={} pending={} nonempty_ordinal={} companion_on_entry={} admission_slow={} accepted_ordinal={:?} accepted_nodes={} utc_begin_us={} utc_end_us={} whole_ms={:.6} pre_prepare_ms={:?} overall_stage_guard_release_ms={:?} owner_tail_request_drop_ms={:?} entry_to_capture_ms={:?} capture_environment_ms={:?} input_prepare_ms={:?} guard_release_ms={:?} pre_ack_ms={:?} ack_ms={:?} ack_result={:?} commit_cleanup_ms={:?} accepted_tail_ms={:?} handle_request_drop_tail_ms={:?} attempt={:?} sample_offset={:?} sampling_enabled_on_attempt={} target_calls={} sampled_calls={} sampled_prepared={} sampled_rejected={} sample_proof_sum_ms={:.6} sample_build_sum_ms={:.6} sample_total_sum_ms={:.6} sample_kind=deterministic_rotating_1of64 sample_extrapolation=none emitted_asof={} eligible_asof={} omitted_asof={} requests_asof={} lost_asof={}",
+                c.ordinal,
+                std::thread::current().id(),
+                c.pipeline,
+                c.epoch,
+                c.goal,
+                c.has_restyle,
+                c.pending,
+                c.nonempty,
+                c.companion,
+                elapsed_ms >= 5.0,
+                c.accepted,
+                c.nodes,
+                c.utc_start,
+                utc_end,
+                elapsed_ms,
+                between(Some(c.start), m[1]),
+                between(m[1], m[3]),
+                between(m[6], Some(end)),
+                between(Some(c.start), m[0]),
+                between(m[0], m[1]),
+                between(m[1], m[2]),
+                between(m[2], m[3]),
+                between(m[3], m[4]),
+                between(m[4], m[5]),
+                c.ack,
+                between(m[5], m[6]),
+                between(m[6], m[7]),
+                between(m[7], Some(end)),
+                c.attempt,
+                c.attempt.map(|n| n % 64),
+                c.sampling_enabled,
+                c.samples.targets,
+                c.samples.sampled,
+                c.samples.prepared,
+                c.samples.rejected,
+                c.samples.proof_ms,
+                c.samples.build_ms,
+                c.samples.total_ms,
+                slot.unwrap() + 1,
+                eligible,
+                OMITTED.load(Ordering::Relaxed),
+                REQUESTS.load(Ordering::Relaxed),
+                LOST.load(Ordering::Relaxed)
+            );
         }
     }
     pub(super) struct Sample {
@@ -1581,9 +1728,11 @@ mod layout_attribution_tests {
                     .collect::<Vec<_>>()
             })
             .collect();
-        assert!(offsets
-            .iter()
-            .all(|samples| samples.len() == 156 || samples.len() == 157));
+        assert!(
+            offsets
+                .iter()
+                .all(|samples| samples.len() == 156 || samples.len() == 157)
+        );
         assert!(offsets.iter().any(|samples| samples[0] % 2 == 0));
         assert!(offsets.iter().any(|samples| samples[0] % 2 == 1));
     }

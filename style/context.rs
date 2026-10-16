@@ -154,6 +154,11 @@ pub struct SharedStyleContext<'a> {
     #[cfg(feature = "servo")]
     pub inline_background_epoch: Option<u64>,
 
+    /// Record a fresh final baseline after ordinary query cascade only. This
+    /// never enables try_recascade, batch preparation, paint or acknowledgment.
+    #[cfg(feature = "servo")]
+    pub inline_background_record_epoch: Option<u64>,
+
     /// Opt-in aggregate counter; absent without profiling/test bindings.
     #[cfg(feature = "servo")]
     pub inline_background_count: Option<&'a std::sync::atomic::AtomicU32>,
