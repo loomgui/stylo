@@ -1161,6 +1161,25 @@ impl Stylist {
         self.stylesheets.get(origin, index)
     }
 
+    /// Whether every document origin proves that STYLE snapshots are unnecessary.
+    /// Callers must separately exclude shadow/non-document scopes and revalidate
+    /// the current stylesheet/device epoch before consuming an omission.
+    #[cfg(feature = "servo")]
+    pub fn document_style_snapshots_independent(&self) -> bool {
+        self.cascade_data
+            .user_agent
+            .cascade_data
+            .can_skip_style_attribute_snapshot_invalidation()
+            && self
+                .cascade_data
+                .user
+                .can_skip_style_attribute_snapshot_invalidation()
+            && self
+                .cascade_data
+                .author
+                .can_skip_style_attribute_snapshot_invalidation()
+    }
+
     /// Returns whether for any of the applicable style rule data a given
     /// condition is true.
     pub fn any_applicable_rule_data<E, F>(&self, element: E, mut f: F) -> bool
@@ -3552,6 +3571,19 @@ impl CascadeData {
         self.attribute_dependencies.contains(local_name)
     }
 
+    /// Complete conservative negative proof used by the certified empty-leaf
+    /// background batch. Unknown scope/container inputs use normal invalidation.
+    #[cfg(feature = "servo")]
+    pub(crate) fn can_skip_style_attribute_snapshot_invalidation(&self) -> bool {
+        let style = LocalName::from("style");
+        self.scope_conditions.len() == 1
+            && self.container_conditions.len() == 1
+            && !self.might_have_attribute_dependency(&style)
+            && !self.might_have_nth_of_attribute_dependency(&style)
+            && self.might_have_attribute_dependency_in_container(&style)
+                == ContainerAttributeDependencyKind::None
+    }
+
     /// Whether matching an element that isn't itself a link can depend on
     /// whether a link is visited. Note this doesn't account for pseudo-element
     /// rules, whose originating element is the one `:visited` would match.
@@ -5073,4 +5105,88 @@ pub fn needs_revalidation_for_testing(s: &Selector<SelectorImpl>) -> bool {
     };
     s.visit(&mut visitor);
     needs_revalidation
+}
+
+#[cfg(all(test, feature = "servo"))]
+mod eager_background_dependency_tests {
+    use super::*;
+
+    #[test]
+    fn eager_background_batch_negative_dependency_proof_rejects_style_nth_scope_and_container_inputs(
+    ) {
+        let style = LocalName::from("style");
+        let mut data = CascadeData::new();
+        assert!(data.can_skip_style_attribute_snapshot_invalidation());
+        data.attribute_dependencies.insert(LocalName::from("title"));
+        assert!(data.can_skip_style_attribute_snapshot_invalidation());
+        data.attribute_dependencies.insert(style.clone());
+        assert!(!data.can_skip_style_attribute_snapshot_invalidation());
+        data.attribute_dependencies.remove(&style);
+        data.nth_of_attribute_dependencies.insert(style.clone());
+        assert!(!data.can_skip_style_attribute_snapshot_invalidation());
+        data.nth_of_attribute_dependencies.remove(&style);
+        data.attr_function_dependencies.insert(
+            style.clone(),
+            ContainerAttributeDependencyKind::UnnamedContainer,
+        );
+        assert!(!data.can_skip_style_attribute_snapshot_invalidation());
+        data.attr_function_dependencies.remove(&style);
+        data.scope_conditions.push(ScopeConditionReference::none());
+        assert!(!data.can_skip_style_attribute_snapshot_invalidation());
+        data.scope_conditions.pop();
+        data.container_conditions
+            .push(ContainerConditionReference::none());
+        assert!(!data.can_skip_style_attribute_snapshot_invalidation());
+        data.container_conditions.pop();
+        assert!(data.can_skip_style_attribute_snapshot_invalidation());
+    }
+
+    #[test]
+    fn eager_background_batch_parsed_relative_has_records_style_dependency() {
+        use crate::selector_parser::SelectorParser;
+        use crate::stylesheets::Namespaces;
+        use selectors::parser::{ParseRelative, RelativeSelector, RelativeSelectorMatchHint};
+
+        // Exercise the collector on a parsed inner relative selector. This does
+        // not enable or claim matching support for the outer :has() syntax.
+        let namespaces = Namespaces::default();
+        let url_data = UrlExtraData(Arc::new(url::Url::parse("about:blank").unwrap()));
+        let parser = SelectorParser {
+            stylesheet_origin: Origin::Author,
+            namespaces: &namespaces,
+            url_data: &url_data,
+            for_supports_rule: false,
+        };
+        let mut input = cssparser::Parser::new(r#"> [style*="blue"]"#);
+        let parsed = SelectorList::parse(&parser, &mut input, ParseRelative::ForHas).unwrap();
+        let relative = RelativeSelector {
+            selector: parsed.slice()[0].clone(),
+            match_hint: RelativeSelectorMatchHint::InChild,
+        };
+        let mut data = CascadeData::new();
+        assert!(data.can_skip_style_attribute_snapshot_invalidation());
+        {
+            let mut needs_revalidation = false;
+            let mut visitor = StylistSelectorVisitor {
+                passed_rightmost_selector: false,
+                needs_revalidation: &mut needs_revalidation,
+                non_link_visited_dependency: &mut data.non_link_visited_dependency,
+                in_selector_list_of: SelectorListKind::default(),
+                mapped_ids: &mut data.mapped_ids,
+                nth_of_mapped_ids: &mut data.nth_of_mapped_ids,
+                attribute_dependencies: &mut data.attribute_dependencies,
+                nth_of_class_dependencies: &mut data.nth_of_class_dependencies,
+                nth_of_attribute_dependencies: &mut data.nth_of_attribute_dependencies,
+                nth_of_custom_state_dependencies: &mut data.nth_of_custom_state_dependencies,
+                state_dependencies: &mut data.state_dependencies,
+                nth_of_state_dependencies: &mut data.nth_of_state_dependencies,
+                document_state_dependencies: &mut data.document_state_dependencies,
+            };
+            assert!(visitor.visit_relative_selector_list(&[relative]));
+        }
+        assert!(data
+            .attribute_dependencies
+            .contains(&LocalName::from("style")));
+        assert!(!data.can_skip_style_attribute_snapshot_invalidation());
+    }
 }

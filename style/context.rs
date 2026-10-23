@@ -19,7 +19,7 @@ use crate::properties::ComputedValues;
 use crate::properties::PropertyId;
 use crate::rule_cache::RuleCache;
 use crate::rule_tree::{RuleCascadeFlags, StrongRuleNode};
-use crate::selector_parser::{SnapshotMap, EAGER_PSEUDO_COUNT};
+use crate::selector_parser::{EAGER_PSEUDO_COUNT, SnapshotMap};
 use crate::shared_lock::StylesheetGuards;
 use crate::sharing::StyleSharingCache;
 use crate::stylist::Stylist;
@@ -28,21 +28,21 @@ use crate::traversal::DomTraversal;
 use crate::traversal_flags::TraversalFlags;
 use crate::values::computed::TreeCountingResult;
 use app_units::Au;
-use euclid::default::Size2D;
 use euclid::Scale;
+use euclid::default::Size2D;
 use rustc_hash::FxHashMap;
-use selectors::context::SelectorCaches;
 use selectors::OpaqueElement;
+use selectors::context::SelectorCaches;
 #[cfg(feature = "gecko")]
 use servo_arc::Arc;
 use std::fmt;
 use std::ops;
 use std::time::{Duration, Instant};
-use style_traits::dom::OpaqueNode;
 use style_traits::CSSPixel;
 use style_traits::DevicePixel;
 #[cfg(feature = "servo")]
 use style_traits::SpeculativePainter;
+use style_traits::dom::OpaqueNode;
 #[cfg(feature = "servo")]
 use stylo_atoms::Atom;
 
@@ -148,6 +148,20 @@ pub struct SharedStyleContext<'a> {
 
     /// A map with our snapshots in order to handle restyle hints.
     pub snapshot_map: &'a SnapshotMap,
+
+    /// Stable global-input generation for guarded inline recascades. None in
+    /// queries, animation-only/global invalidation or unknown environments.
+    #[cfg(feature = "servo")]
+    pub inline_background_epoch: Option<u64>,
+
+    /// Record a fresh final baseline after ordinary query cascade only. This
+    /// never enables try_recascade, batch preparation, paint or acknowledgment.
+    #[cfg(feature = "servo")]
+    pub inline_background_record_epoch: Option<u64>,
+
+    /// Opt-in aggregate counter; absent without profiling/test bindings.
+    #[cfg(feature = "servo")]
+    pub inline_background_count: Option<&'a std::sync::atomic::AtomicU32>,
 
     /// The state of all animations for our styled elements.
     #[cfg(feature = "servo")]
@@ -295,6 +309,8 @@ pub struct PerThreadTraversalStatistics {
     /// The number of styles reused via rule node comparison from the
     /// StyleSharingCache.
     pub styles_reused: u32,
+    /// Accepted incremental background-color cascades, when collection is enabled.
+    pub inline_background_color_recascades: u32,
 }
 
 /// Statistics gathered during the traversal plus some information from
@@ -352,6 +368,11 @@ impl fmt::Display for TraversalStatistics {
         )?;
         writeln!(f, "[PERF],styles_shared,{}", self.aggregated.styles_shared)?;
         writeln!(f, "[PERF],styles_reused,{}", self.aggregated.styles_reused)?;
+        writeln!(
+            f,
+            "[PERF],inline_background_color_recascades,{}",
+            self.aggregated.inline_background_color_recascades
+        )?;
         writeln!(f, "[PERF],selectors,{}", self.selectors)?;
         writeln!(
             f,

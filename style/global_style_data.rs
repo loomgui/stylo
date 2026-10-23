@@ -74,7 +74,7 @@ fn thread_name(index: usize) -> String {
 /// thread pool is shut-down, so the size of this list is bounded.
 static STYLE_THREAD_JOIN_HANDLES: Mutex<Vec<thread::JoinHandle<()>>> = Mutex::new(Vec::new());
 
-fn thread_spawn(options: rayon::ThreadBuilder) -> io::Result<()> {
+fn spawn_style_thread(options: rayon::ThreadBuilder) -> io::Result<thread::JoinHandle<()>> {
     let mut b = thread::Builder::new();
     if let Some(name) = options.name() {
         b = b.name(name.to_owned());
@@ -82,7 +82,11 @@ fn thread_spawn(options: rayon::ThreadBuilder) -> io::Result<()> {
     if let Some(stack_size) = options.stack_size() {
         b = b.stack_size(stack_size);
     }
-    let join_handle = b.spawn(|| options.run())?;
+    b.spawn(|| options.run())
+}
+
+fn thread_spawn(options: rayon::ThreadBuilder) -> io::Result<()> {
+    let join_handle = spawn_style_thread(options)?;
     STYLE_THREAD_JOIN_HANDLES.lock().push(join_handle);
     Ok(())
 }
@@ -168,6 +172,30 @@ fn stylo_threads_pref() -> i32 {
 /// there on many-core machines (see bug 1431285 comment 14).
 pub(crate) const STYLO_MAX_THREADS: usize = 6;
 
+fn build_style_thread_pool<F>(
+    num_threads: usize,
+    spawn_handler: F,
+) -> Result<rayon::ThreadPool, rayon::ThreadPoolBuildError>
+where
+    F: FnMut(rayon::ThreadBuilder) -> io::Result<()>,
+{
+    let builder = rayon::ThreadPoolBuilder::new()
+        .spawn_handler(spawn_handler)
+        .num_threads(num_threads)
+        .thread_name(thread_name)
+        .start_handler(thread_startup)
+        .exit_handler(thread_shutdown)
+        .stack_size(STYLE_THREAD_STACK_SIZE_KB * 1024);
+
+    // Gecko enters traversal on the main thread that owns pool index zero.
+    #[cfg(feature = "gecko")]
+    let builder = builder.use_current_thread();
+
+    // Servo can create this process-global pool while loading an earlier document.
+    // Every configured worker must remain available after that script thread exits.
+    builder.build()
+}
+
 /// Global thread pool
 pub static STYLE_THREAD_POOL: LazyLock<StyleThreadPool> = LazyLock::new(|| {
     use std::cmp;
@@ -194,20 +222,12 @@ pub static STYLE_THREAD_POOL: LazyLock<StyleThreadPool> = LazyLock::new(|| {
     };
 
     let num_threads = cmp::min(num_threads, STYLO_MAX_THREADS);
-    // Since the main-thread is also part of the pool, having one thread or less doesn't make
-    // sense.
+    // Retain the existing serial mode when parallel styling is disabled or only
+    // one thread is requested.
     let (pool, num_threads) = if num_threads <= 1 {
         (None, None)
     } else {
-        let workers = rayon::ThreadPoolBuilder::new()
-            .spawn_handler(thread_spawn)
-            .use_current_thread()
-            .num_threads(num_threads)
-            .thread_name(thread_name)
-            .start_handler(thread_startup)
-            .exit_handler(thread_shutdown)
-            .stack_size(STYLE_THREAD_STACK_SIZE_KB * 1024)
-            .build();
+        let workers = build_style_thread_pool(num_threads, thread_spawn);
         (workers.ok(), Some(num_threads))
     };
 
@@ -222,3 +242,86 @@ pub static GLOBAL_STYLE_DATA: LazyLock<GlobalStyleData> = LazyLock::new(|| Globa
     shared_lock: SharedRwLock::new_leaked(),
     options: StyleSystemOptions::default(),
 });
+
+#[cfg(all(test, feature = "servo", not(feature = "gecko")))]
+mod tests {
+    use super::*;
+    use std::collections::{BTreeMap, HashSet};
+    use std::sync::{Arc, mpsc};
+    use std::time::{Duration, Instant};
+
+    fn join_bounded<T>(handle: thread::JoinHandle<T>) -> T {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            handle.is_finished(),
+            "style-pool test thread must terminate"
+        );
+        handle.join().expect("style-pool test thread panicked")
+    }
+
+    #[test]
+    fn all_configured_style_workers_survive_the_pool_creator() {
+        // Exercise the same builder, spawn implementation and lifecycle hooks as
+        // the global pool, with private join handles to isolate other unit tests.
+        let handles = Arc::new(Mutex::new(Vec::new()));
+        let creator_handles = handles.clone();
+        let (created_tx, created_rx) = mpsc::channel();
+        let creator = thread::spawn(move || {
+            let creator_id = thread::current().id();
+            let pool = build_style_thread_pool(3, move |options| {
+                creator_handles.lock().push(spawn_style_thread(options)?);
+                Ok(())
+            })
+            .expect("create the production style pool");
+            created_tx.send((creator_id, pool)).unwrap();
+        });
+        let (creator_id, pool) = created_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the production style pool must finish construction");
+        join_bounded(creator);
+        assert_eq!(pool.current_num_threads(), 3);
+
+        // Unlike broadcast(), this cannot wait forever for a reserved slot whose
+        // creator has exited. The old use_current_thread path reports only 1/2.
+        let (worker_tx, worker_rx) = mpsc::channel();
+        pool.spawn_broadcast(move |context| {
+            worker_tx
+                .send((context.index(), thread::current().id()))
+                .unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut workers = BTreeMap::new();
+        while workers.len() < 3 {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            match worker_rx.recv_timeout(remaining) {
+                Ok((index, id)) => {
+                    workers.insert(index, id);
+                },
+                Err(_) => break,
+            }
+        }
+        assert_eq!(
+            workers.len(),
+            3,
+            "all configured style workers must remain live after the creator exits; observed {workers:?}"
+        );
+        assert_eq!(workers.keys().copied().collect::<Vec<_>>(), vec![0, 1, 2]);
+        let worker_ids: HashSet<_> = workers.into_values().collect();
+        assert_eq!(worker_ids.len(), 3);
+        assert!(!worker_ids.contains(&creator_id));
+
+        // Pool drop requests asynchronous termination. Only join handles already
+        // observed finished, so cleanup is bounded even if shutdown regresses.
+        drop(pool);
+        let owned_handles = std::mem::take(&mut *handles.lock());
+        assert_eq!(owned_handles.len(), 3);
+        for handle in owned_handles {
+            join_bounded(handle);
+        }
+    }
+}

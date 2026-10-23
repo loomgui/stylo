@@ -498,6 +498,8 @@ where
     }
 
     let mut important_rules_changed = false;
+    #[cfg(feature = "servo")]
+    let mut incremental_background = None;
     let new_styles = match kind {
         MatchAndCascade => {
             debug_assert!(
@@ -560,13 +562,24 @@ where
             let mut cascade_inputs = ElementCascadeInputs::new_from_element_data(data);
             important_rules_changed = element.replace_rules(flags, context, &mut cascade_inputs);
 
+            #[cfg(feature = "servo")]
+            let incremental =
+                crate::inline_background::try_recascade(context, element, data, &cascade_inputs);
             let mut resolver = StyleResolverForElement::new(
                 element,
                 context,
                 RuleInclusion::All,
                 PseudoElementResolution::IfApplicable,
             );
-
+            #[cfg(feature = "servo")]
+            if let Some(primary) = incremental {
+                incremental_background =
+                    Some((data.styles.primary().clone(), primary.style.0.clone()));
+                resolver.cascade_pseudos_with_default_parents(primary, cascade_inputs.pseudos)
+            } else {
+                resolver.cascade_styles_with_default_parents(cascade_inputs)
+            }
+            #[cfg(not(feature = "servo"))]
             resolver.cascade_styles_with_default_parents(cascade_inputs)
         },
         CascadeOnly => {
@@ -613,7 +626,13 @@ where
         },
     };
 
-    element.finish_restyle(context, data, new_styles, important_rules_changed)
+    let children_hint = element.finish_restyle(context, data, new_styles, important_rules_changed);
+    #[cfg(feature = "servo")]
+    {
+        // Record only the actual final style, after normal animation processing.
+        crate::inline_background::record_final(context, element, data, incremental_background);
+    }
+    children_hint
 }
 
 #[cfg(feature = "servo")]

@@ -1641,6 +1641,48 @@ pub struct ComputedValues {
 }
 
 impl ComputedValues {
+    /// Whether all computed style data except background-color is unchanged.
+    ///
+    /// Intended for embedders retaining an existing background primitive. This
+    /// deliberately compares more than restyle damage: repaint-only properties,
+    /// custom properties, dependencies and visited styles must not be overlooked.
+    #[cfg(feature = "servo")]
+    pub fn same_except_background_color(&self, other: &Self) -> bool {
+        if self.pseudo != other.pseudo ||
+            self.writing_mode != other.writing_mode ||
+            self.effective_zoom != other.effective_zoom ||
+            self.flags != other.flags ||
+            self.custom_properties != other.custom_properties ||
+            self.attribute_references != other.attribute_references ||
+            self.visited_style.is_some() || other.visited_style.is_some()
+        {
+            return false;
+        }
+        % for style_struct in data.active_style_structs():
+        % if style_struct.name == "Background":
+        let old = self.get_background();
+        let new = other.get_background();
+        if !std::ptr::eq(old, new) && (
+            % for longhand in style_struct.longhands:
+            % if not longhand.logical and longhand.ident != "background_color":
+            old.${longhand.ident} != new.${longhand.ident} ||
+            % endif
+            % endfor
+            false)
+        {
+            return false;
+        }
+        % else:
+        if !std::ptr::eq(self.get_${style_struct.name_lower}(), other.get_${style_struct.name_lower}()) &&
+            self.get_${style_struct.name_lower}() != other.get_${style_struct.name_lower}()
+        {
+            return false;
+        }
+        % endif
+        % endfor
+        true
+    }
+
     /// Returns the pseudo-element that this style represents.
     #[cfg(feature = "servo")]
     pub fn pseudo(&self) -> Option<PseudoElement> {
@@ -1997,6 +2039,15 @@ impl ComputedValuesInner {
             },
             pseudo: pseudo.cloned(),
         })
+    }
+
+    /// Mutate only a uniquely owned scratch Background allocation. This never
+    /// copies or mutates a shared style struct; the caller also owns the outer
+    /// ComputedValues uniquely and retains no published reference to it.
+    #[cfg(feature = "servo")]
+    #[inline]
+    pub(crate) fn try_mutate_unique_background(&mut self) -> Option<&mut style_structs::Background> {
+        Arc::get_mut(&mut self.background)
     }
 
     /// Returns the visited style, if any.

@@ -9,19 +9,19 @@ use crate::color::AbsoluteColor;
 use crate::computed_value_flags::ComputedValueFlags;
 use crate::context::TreeCountingCaches;
 use crate::custom_properties::{
-    get_attr_value_for_cycle_resolution, handle_invalid_at_computed_value_time,
-    remove_and_insert_initial_value, substitute_references_if_needed_and_apply,
     ComputedCustomProperties, ComputedSubstitutionFunctions, Name, NonCustomReferenceMap,
     ReferenceFlags, References, SingleNonCustomReference, SubstitutionFunctionKind, VariableValue,
+    get_attr_value_for_cycle_resolution, handle_invalid_at_computed_value_time,
+    remove_and_insert_initial_value, substitute_references_if_needed_and_apply,
 };
 use crate::dom::{AttributeTracker, DummyElementContext, ElementContext, TElement};
 #[cfg(feature = "gecko")]
 use crate::font_metrics::FontMetricsOrientation;
 use crate::properties::{
-    property_counts, CSSWideKeyword, ComputedValues, DeclarationImportanceIterator, LonghandId,
+    CASCADE_PROPERTY, CSSWideKeyword, ComputedValues, DeclarationImportanceIterator, LonghandId,
     LonghandIdSet, PrioritaryPropertyId, PrioritaryPropertyIdSet, PropertyDeclaration,
     PropertyDeclarationId, PropertyFlags, ShorthandsWithPropertyReferencesCache, StyleBuilder,
-    CASCADE_PROPERTY,
+    property_counts,
 };
 use crate::properties::{CustomDeclaration, CustomDeclarationValue, UnparsedValue};
 use crate::properties_and_values::rule::Descriptors as PropertyDescriptors;
@@ -32,9 +32,9 @@ use crate::selector_map::{PrecomputedHashMap, PrecomputedHashSet};
 use crate::selector_parser::PseudoElement;
 use crate::shared_lock::StylesheetGuards;
 use crate::style_adjuster::StyleAdjuster;
+use crate::stylesheets::UrlExtraData;
 use crate::stylesheets::container_rule::ContainerSizeQuery;
 use crate::stylesheets::layer_rule::LayerOrder;
-use crate::stylesheets::UrlExtraData;
 use crate::stylist::Stylist;
 use crate::values::computed::ToComputedValue;
 #[cfg(feature = "gecko")]
@@ -192,6 +192,43 @@ impl<'a> Iterator for DeclarationIterator<'a> {
             self.update_for_node(next_node);
         }
     }
+}
+
+/// Prove the first applicable background declaration is the given normal inline
+/// absolute value. In particular, equal old colors do not prove rule priority.
+#[cfg(feature = "servo")]
+pub(crate) fn normal_inline_background_wins(
+    rules: &StrongRuleNode,
+    guards: &StylesheetGuards,
+    inline: &crate::shared_lock::Locked<crate::properties::PropertyDeclarationBlock>,
+    color: crate::color::AbsoluteColor,
+) -> bool {
+    for (declaration, priority) in DeclarationIterator::new(rules, guards, None) {
+        if declaration.id()
+            != crate::properties::PropertyDeclarationId::Longhand(
+                crate::properties::LonghandId::BackgroundColor,
+            )
+        {
+            continue;
+        }
+        if !priority.flags().is_empty()
+            || priority.cascade_level() != CascadeLevel::same_tree_author_normal()
+            || priority.layer_order() != LayerOrder::style_attribute()
+        {
+            return false;
+        }
+        let Some(source) = rules
+            .self_and_ancestors()
+            .find(|node| node.cascade_priority() == priority)
+            .and_then(|node| node.style_source())
+        else {
+            return false;
+        };
+        return std::ptr::eq(source.read(guards.author), inline.read_with(guards.author))
+            && crate::properties::declaration_block::independent_background_color(declaration)
+                == Some(color);
+    }
+    false
 }
 
 fn cascade_rules<E>(
@@ -2700,5 +2737,153 @@ fn substitute_all(
     // properties.
     for attr in &seen.attr {
         run_one(VarType::Attr((*attr).clone()));
+    }
+}
+
+#[cfg(all(test, feature = "servo"))]
+mod inline_background_priority_tests {
+    use super::*;
+    use crate::applicable_declarations::CascadePriority;
+    use crate::color::AbsoluteColor;
+    use crate::properties::declaration_block::Importance;
+    use crate::properties::{CSSWideKeyword, LonghandId, PropertyDeclarationBlock};
+    use crate::rule_tree::{RuleTree, StyleSource};
+    use crate::shared_lock::SharedRwLock;
+    use crate::stylesheets::layer_rule::LayerOrder;
+    use servo_arc::Arc;
+
+    fn priority(level: CascadeLevel, layer: LayerOrder) -> CascadePriority {
+        CascadePriority::new(level, layer, RuleCascadeFlags::empty())
+    }
+
+    fn block(
+        lock: &SharedRwLock,
+        color: AbsoluteColor,
+        important: bool,
+    ) -> Arc<crate::shared_lock::Locked<PropertyDeclarationBlock>> {
+        Arc::new(lock.wrap(PropertyDeclarationBlock::with_one(
+            PropertyDeclaration::BackgroundColor(color.into()),
+            if important {
+                Importance::Important
+            } else {
+                Importance::Normal
+            },
+        )))
+    }
+
+    #[test]
+    fn inline_background_priority_normal_inline_wins_but_equal_important_old_color_does_not_prove_winner()
+     {
+        let lock = SharedRwLock::new();
+        let guard = lock.read();
+        let guards = StylesheetGuards {
+            author: &guard,
+            ua_or_user: &guard,
+        };
+        let red = AbsoluteColor::srgb_legacy(255, 0, 0, 1.);
+        let green = AbsoluteColor::srgb_legacy(0, 255, 0, 1.);
+        let inline = block(&lock, green, false);
+        let stylesheet = block(&lock, red, false);
+        let tree = RuleTree::new();
+        let normal = priority(CascadeLevel::same_tree_author_normal(), LayerOrder::root());
+        let inline_priority = priority(
+            CascadeLevel::same_tree_author_normal(),
+            LayerOrder::style_attribute(),
+        );
+        let rules = tree.insert_ordered_rules(
+            [
+                (StyleSource::from_declarations(stylesheet), normal),
+                (
+                    StyleSource::from_declarations(inline.clone()),
+                    inline_priority,
+                ),
+            ]
+            .into_iter(),
+        );
+        assert!(normal_inline_background_wins(
+            &rules, &guards, &inline, green
+        ));
+        let important = block(&lock, red, true);
+        let important_rules = tree.insert_ordered_rules(
+            [
+                (
+                    StyleSource::from_declarations(inline.clone()),
+                    inline_priority,
+                ),
+                (
+                    StyleSource::from_declarations(important),
+                    priority(
+                        CascadeLevel::same_tree_author_important(),
+                        LayerOrder::root(),
+                    ),
+                ),
+            ]
+            .into_iter(),
+        );
+        // The previous inline red could have equaled important red. After its
+        // mutation to green the important declaration must still win.
+        assert!(!normal_inline_background_wins(
+            &important_rules,
+            &guards,
+            &inline,
+            green
+        ));
+    }
+
+    #[test]
+    fn inline_background_priority_revert_or_wrong_source_falls_back() {
+        let lock = SharedRwLock::new();
+        let guard = lock.read();
+        let guards = StylesheetGuards {
+            author: &guard,
+            ua_or_user: &guard,
+        };
+        let green = AbsoluteColor::srgb_legacy(0, 255, 0, 1.);
+        let inline = block(&lock, green, false);
+        let other_inline = block(&lock, green, false);
+        let tree = RuleTree::new();
+        let inline_priority = priority(
+            CascadeLevel::same_tree_author_normal(),
+            LayerOrder::style_attribute(),
+        );
+        let wrong_source = tree.insert_ordered_rules(
+            [(
+                StyleSource::from_declarations(other_inline),
+                inline_priority,
+            )]
+            .into_iter(),
+        );
+        assert!(!normal_inline_background_wins(
+            &wrong_source,
+            &guards,
+            &inline,
+            green
+        ));
+        let revert = Arc::new(lock.wrap(PropertyDeclarationBlock::with_one(
+            PropertyDeclaration::css_wide_keyword(
+                LonghandId::BackgroundColor,
+                CSSWideKeyword::Revert,
+            ),
+            Importance::Important,
+        )));
+        let rules = tree.insert_ordered_rules(
+            [
+                (
+                    StyleSource::from_declarations(inline.clone()),
+                    inline_priority,
+                ),
+                (
+                    StyleSource::from_declarations(revert),
+                    priority(
+                        CascadeLevel::same_tree_author_important(),
+                        LayerOrder::root(),
+                    ),
+                ),
+            ]
+            .into_iter(),
+        );
+        assert!(!normal_inline_background_wins(
+            &rules, &guards, &inline, green
+        ));
     }
 }

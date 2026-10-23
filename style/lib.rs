@@ -87,6 +87,8 @@ pub mod font_metrics;
 #[allow(unsafe_code)]
 pub mod gecko_bindings;
 pub mod global_style_data;
+#[cfg(feature = "servo")]
+pub mod inline_background;
 pub mod invalidation;
 #[allow(missing_docs)] // TODO.
 pub mod logical_geometry;
