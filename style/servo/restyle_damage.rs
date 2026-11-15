@@ -7,6 +7,7 @@
 
 use bitflags::Flags;
 
+use crate::computed_values::border_collapse::T as BorderCollapse;
 use crate::computed_values::isolation::T as Isolation;
 use crate::computed_values::mix_blend_mode::T as MixBlendMode;
 use crate::computed_values::transform_style::T as TransformStyle;
@@ -161,6 +162,29 @@ fn augmented_restyle_damage_rebuild_box(old: &ComputedValues, new: &ComputedValu
         || old_box.original_display != new_box.original_display
         || old_box.has_transform_or_perspective() != new_box.has_transform_or_perspective()
         || old.get_effects().filter.0.is_empty() != new.get_effects().filter.0.is_empty()
+        || collapsed_border_color_changed(old, new)
+}
+
+/// Border colors only need a repaint, except in the collapsing border model:
+/// layout resolves the winning border of each table grid edge (from the cell,
+/// row, row group, column, column group and table) and stores its color on
+/// the table grid, so a border color change there must run table layout
+/// again. `color` matters as well, because `currentcolor` borders resolve
+/// against it. `border-collapse` is inherited, so every table part of a
+/// collapsing table sees it.
+fn collapsed_border_color_changed(old: &ComputedValues, new: &ComputedValues) -> bool {
+    let collapsing = |style: &ComputedValues| {
+        style.get_inherited_table().border_collapse == BorderCollapse::Collapse
+    };
+    if !collapsing(old) && !collapsing(new) {
+        return false;
+    }
+    let (old_border, new_border) = (old.get_border(), new.get_border());
+    old_border.border_top_color != new_border.border_top_color
+        || old_border.border_right_color != new_border.border_right_color
+        || old_border.border_bottom_color != new_border.border_bottom_color
+        || old_border.border_left_color != new_border.border_left_color
+        || old.get_inherited_text().color != new.get_inherited_text().color
 }
 
 fn augmented_restyle_damage_rebuild_stacking_context(

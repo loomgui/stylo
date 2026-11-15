@@ -2824,6 +2824,7 @@ spec = "https://drafts.csswg.org/css-backgrounds/#border-top-color"
 logical_group = "border-color"
 allow_quirks = true
 ignored_when_colors_disabled = true
+servo_restyle_damage = "repaint"
 affects = "paint"
 
 [border-right-color]
@@ -2834,6 +2835,7 @@ spec = "https://drafts.csswg.org/css-backgrounds/#border-right-color"
 logical_group = "border-color"
 allow_quirks = true
 ignored_when_colors_disabled = true
+servo_restyle_damage = "repaint"
 affects = "paint"
 
 [border-bottom-color]
@@ -2844,6 +2846,7 @@ spec = "https://drafts.csswg.org/css-backgrounds/#border-bottom-color"
 logical_group = "border-color"
 allow_quirks = true
 ignored_when_colors_disabled = true
+servo_restyle_damage = "repaint"
 affects = "paint"
 
 [border-left-color]
@@ -2854,6 +2857,7 @@ spec = "https://drafts.csswg.org/css-backgrounds/#border-left-color"
 logical_group = "border-color"
 allow_quirks = true
 ignored_when_colors_disabled = true
+servo_restyle_damage = "repaint"
 affects = "paint"
 
 [border-block-start-color]
