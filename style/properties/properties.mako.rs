@@ -1648,6 +1648,22 @@ impl ComputedValues {
     /// custom properties, dependencies and visited styles must not be overlooked.
     #[cfg(feature = "servo")]
     pub fn same_except_background_color(&self, other: &Self) -> bool {
+        self.same_except_colors(other, /* ignore_border_colors = */ false)
+    }
+
+    /// Whether all computed style data except background-color and the four
+    /// physical border colors is unchanged.
+    ///
+    /// Intended for embedders retaining existing background and border
+    /// primitives. Border widths, styles, radii and images are still compared,
+    /// and so is `color`, which `currentcolor` borders resolve against.
+    #[cfg(feature = "servo")]
+    pub fn same_except_background_and_border_colors(&self, other: &Self) -> bool {
+        self.same_except_colors(other, /* ignore_border_colors = */ true)
+    }
+
+    #[cfg(feature = "servo")]
+    fn same_except_colors(&self, other: &Self, ignore_border_colors: bool) -> bool {
         if self.pseudo != other.pseudo ||
             self.writing_mode != other.writing_mode ||
             self.effective_zoom != other.effective_zoom ||
@@ -1666,6 +1682,23 @@ impl ComputedValues {
             % for longhand in style_struct.longhands:
             % if not longhand.logical and longhand.ident != "background_color":
             old.${longhand.ident} != new.${longhand.ident} ||
+            % endif
+            % endfor
+            false)
+        {
+            return false;
+        }
+        % elif style_struct.name == "Border":
+        let old = self.get_border();
+        let new = other.get_border();
+        if !std::ptr::eq(old, new) && (
+            % for longhand in style_struct.longhands:
+            % if not longhand.logical:
+            % if longhand.ident in ["border_top_color", "border_right_color", "border_bottom_color", "border_left_color"]:
+            (!ignore_border_colors && old.${longhand.ident} != new.${longhand.ident}) ||
+            % else:
+            old.${longhand.ident} != new.${longhand.ident} ||
+            % endif
             % endif
             % endfor
             false)
