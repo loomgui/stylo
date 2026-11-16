@@ -1641,13 +1641,7 @@ pub struct ComputedValues {
 }
 
 impl ComputedValues {
-    /// Whether all computed style data except background-color is unchanged.
-    ///
-    /// Intended for embedders retaining an existing background primitive. This
-    /// deliberately compares more than restyle damage: repaint-only properties,
-    /// custom properties, dependencies and visited styles must not be overlooked.
-    #[cfg(feature = "servo")]
-    pub fn same_except_background_color(&self, other: &Self) -> bool {
+    <%def name="same_except_longhands(struct_name, idents)">
         if self.pseudo != other.pseudo ||
             self.writing_mode != other.writing_mode ||
             self.effective_zoom != other.effective_zoom ||
@@ -1659,15 +1653,18 @@ impl ComputedValues {
             return false;
         }
         % for style_struct in data.active_style_structs():
-        % if style_struct.name == "Background":
-        let old = self.get_background();
-        let new = other.get_background();
+        % if style_struct.name == struct_name:
+        let old = self.get_${style_struct.name_lower}();
+        let new = other.get_${style_struct.name_lower}();
         if !std::ptr::eq(old, new) && (
             % for longhand in style_struct.longhands:
-            % if not longhand.logical and longhand.ident != "background_color":
+            % if not longhand.logical and longhand.ident not in idents:
             old.${longhand.ident} != new.${longhand.ident} ||
             % endif
             % endfor
+            % if style_struct.name == "Box":
+            old.original_display != new.original_display ||
+            % endif
             false)
         {
             return false;
@@ -1681,6 +1678,37 @@ impl ComputedValues {
         % endif
         % endfor
         true
+    </%def>
+    /// Whether all computed style data except background-color is unchanged.
+    ///
+    /// Intended for embedders retaining an existing background primitive. This
+    /// deliberately compares more than restyle damage: repaint-only properties,
+    /// custom properties, dependencies and visited styles must not be overlooked.
+    #[cfg(feature = "servo")]
+    pub fn same_except_background_color(&self, other: &Self) -> bool {
+        ${same_except_longhands("Background", ["background_color"])}
+    }
+
+    /// Whether all computed style data except the physical box offsets
+    /// (`top`, `right`, `bottom` and `left`) is unchanged.
+    ///
+    /// Intended for embedders that move an existing out-of-flow box without
+    /// laying it out again. Like [`Self::same_except_background_color`], this
+    /// compares every other longhand, custom properties, dependencies and
+    /// visited styles, not only restyle damage.
+    #[cfg(feature = "servo")]
+    pub fn same_except_box_offsets(&self, other: &Self) -> bool {
+        ${same_except_longhands("Position", ["top", "right", "bottom", "left"])}
+    }
+
+    /// Whether all computed style data except `transform`, `translate`,
+    /// `rotate` and `scale` is unchanged.
+    ///
+    /// Intended for embedders that update the transform of an existing
+    /// reference frame without rebuilding its contents.
+    #[cfg(feature = "servo")]
+    pub fn same_except_transform(&self, other: &Self) -> bool {
+        ${same_except_longhands("Box", ["transform", "translate", "rotate", "scale"])}
     }
 
     /// Returns the pseudo-element that this style represents.
