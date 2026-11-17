@@ -1689,23 +1689,14 @@ impl ComputedValues {
         ${same_except_longhands("Background", ["background_color"])}
     }
 
-    /// Whether all computed style data except the physical box offsets
-    /// (`top`, `right`, `bottom` and `left`) is unchanged.
-    ///
-    /// Intended for embedders that move an existing out-of-flow box without
-    /// laying it out again. Like [`Self::same_except_background_color`], this
-    /// compares every other longhand, custom properties, dependencies and
-    /// visited styles, not only restyle damage.
-    #[cfg(feature = "servo")]
-    pub fn same_except_box_offsets(&self, other: &Self) -> bool {
-        ${same_except_longhands("Position", ["top", "right", "bottom", "left"])}
-    }
-
     /// Whether all computed style data except `transform`, `translate`,
     /// `rotate` and `scale` is unchanged.
     ///
     /// Intended for embedders that update the transform of an existing
-    /// reference frame without rebuilding its contents.
+    /// reference frame without rebuilding its contents. Like
+    /// [`Self::same_except_background_color`], this compares every other
+    /// longhand, custom properties, dependencies and visited styles, not only
+    /// restyle damage.
     #[cfg(feature = "servo")]
     pub fn same_except_transform(&self, other: &Self) -> bool {
         ${same_except_longhands("Box", ["transform", "translate", "rotate", "scale"])}
